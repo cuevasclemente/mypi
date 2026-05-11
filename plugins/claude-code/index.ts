@@ -225,7 +225,7 @@ export default function claudeCode(pi: ExtensionAPI) {
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 200000,
-				maxTokens: 8192,
+				maxTokens: 64000,
 			},
 			{
 				id: "sonnet",
@@ -233,8 +233,8 @@ export default function claudeCode(pi: ExtensionAPI) {
 				reasoning: false,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 200000,
-				maxTokens: 8192,
+				contextWindow: 1000000,
+				maxTokens: 128000,
 			},
 			{
 				id: "opus",
@@ -242,8 +242,8 @@ export default function claudeCode(pi: ExtensionAPI) {
 				reasoning: false,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 200000,
-				maxTokens: 8192,
+				contextWindow: 1000000,
+				maxTokens: 128000,
 			},
 		],
 	});
