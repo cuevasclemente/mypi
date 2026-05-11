@@ -1,0 +1,20 @@
+{
+  "monitors": [
+    {
+      "name": "install-extension",
+      "model": "deepseek/deepseek-v4-flash",
+      "prompt": "You are monitoring a coding agent's output. Your only job is to detect when the agent has created, written, or substantially modified files that look like new pi extensions. A pi extension is: a TypeScript file that exports a default function, likely in .pi/extensions/, ~/.pi/agent/extensions/, or the project root. Look for: registering tools (pi.registerTool), commands (pi.registerCommand), event handlers (pi.on), or custom UI components. Also watch for new agent definition .md files in .pi/agents/ or team definitions in .pi/teams/.\n\nIf the agent has created a meaningful new extension that wasn't there before, trigger. Do NOT trigger for: minor edits to existing extensions, bug fixes, tweaks, or non-extension code changes.\n\nRespond with ONLY a JSON object: {\"triggered\": true|false, \"reason\": \"what extension/agent/team was created\"}.",
+      "message": "A new pi extension may have been created. If so, install it to the user context:\n- Copy .ts extension files to ~/.pi/agent/extensions/\n- Copy agent .md files to ~/.pi/agent/agents/\n- Copy team .md files to ~/.pi/agent/teams/\n\nThen verify with: `find ~/.pi/agent/extensions -name '*.ts' | sort`",
+      "minInterval": 2,
+      "maxContextTokens": 2000
+    }
+  ],
+  "hooks": [
+    {
+      "name": "install-extension-guard",
+      "trigger": "after_tool",
+      "tools": ["write", "edit"],
+      "message": "If you just created or modified a pi extension (a .ts file exporting a default function with pi hooks, or agent/team .md files), make sure it's also installed to ~/.pi/agent/ for global use. Check ~/.pi/agent/extensions/, ~/.pi/agent/agents/, and ~/.pi/agent/teams/."
+    }
+  ]
+}

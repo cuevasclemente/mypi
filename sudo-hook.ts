@@ -15,6 +15,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { matchesKey, Key } from "@earendil-works/pi-tui";
 
 /** Escape single quotes in a string for use in a single-quoted shell string. */
 function shellEscape(s: string): string {
@@ -50,38 +51,41 @@ export default function (pi: ExtensionAPI) {
         };
 
         const component = {
-          render() {
+          render(_width: number) {
             return displayText().split("\n");
           },
-          handleInput(data: string): boolean {
-            if (data === "return" || data === "enter") {
+          invalidate() {
+            // No cached state to clear
+          },
+          handleInput(data: string): void {
+            if (matchesKey(data, Key.enter)) {
               done(buffer || null);
-              return true;
+              return;
             }
-            if (data === "escape") {
+            if (matchesKey(data, Key.escape)) {
               done(null);
-              return true;
+              return;
             }
-            if (data === "backspace" || data === "delete") {
+            if (matchesKey(data, Key.backspace) || matchesKey(data, Key.delete)) {
               if (buffer.length > 0) {
                 buffer = buffer.slice(0, -1);
               }
-              return true;
+              tui.requestRender();
+              return;
             }
-            if (data === "ctrl+c") {
+            if (matchesKey(data, Key.ctrl("c"))) {
               done(null);
-              return true;
+              return;
             }
             // Only accept printable characters (single UTF-8 characters)
-            if (typeof data === "string" && data.length >= 1 && data !== "\x1b") {
-              // Filter out control characters
-              const printable = data.replace(/[\x00-\x1f\x7f]/g, "");
-              if (printable.length > 0) {
-                buffer += printable;
+            if (typeof data === "string" && data.length === 1) {
+              const code = data.charCodeAt(0);
+              // Accept printable ASCII (32-126) and any non-control Unicode
+              if (code >= 32 && code !== 127) {
+                buffer += data;
+                tui.requestRender();
               }
-              return true;
             }
-            return false;
           },
         };
         return component;

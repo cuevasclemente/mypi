@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "exa-mcp-server": "^3.2.1"
+  }
+}

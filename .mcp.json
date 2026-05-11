@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "mempalace": {
+      "command": "/home/clemente/src/memoriki/.venv/bin/python3",
+      "args": ["-m", "mempalace.mcp_server"],
+      "cwd": "/home/clemente/src/memoriki",
+      "lifecycle": "lazy"
+    },
+    "exasearch": {
+      "command": "/home/clemente/src/mypi/.pi/exa-mcp-wrapper.sh",
+      "args": [],
+      "lifecycle": "lazy"
+    }
+  }
+}

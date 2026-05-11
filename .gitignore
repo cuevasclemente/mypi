@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit. See README.md for what each plugin expects here.
+secure_data/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Per-session pi state. Project config under .pi/ (agents, extensions, teams,
+# wrapper scripts) IS tracked — only sessions/auth files are excluded.
+.pi/sessions/
+.pi/agent/
