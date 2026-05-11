@@ -47,8 +47,8 @@ export default function narwhalHorn(pi: ExtensionAPI) {
 				reasoning: true,
 				input: ["text", "image"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 32768,
-				maxTokens: 8192,
+				contextWindow: 262144,
+				maxTokens: 32768,
 				compat: {
 					// llama.cpp with --jinja respects chat_template_kwargs.enable_thinking
 					// on this abliterated tune. /no_think tag does not work — confirmed
