@@ -34,6 +34,7 @@ Pi extensions, skills, and hooks development workspace.
 
 - **Runtime:** Pi loads extensions from `~/.pi/agent/extensions/`, skills from `~/.pi/agent/skills/`
 - **Development:** Work on extensions in `plugins/`, skills in `skills/`, then deploy to `~/.pi/agent/` when ready
+- **Deployment:** Use the Makefile to copy or symlink repo plugins into the pi extension discovery directories
 - **Testing locally:** Use `--extension` / `--skill` flags to load directly from this repo without installing globally
 
 ```bash
@@ -48,6 +49,40 @@ pi --skill ./skills/mcp/ "use the mcp skill"
 
 - **Project-local** (`.pi/extensions/`): Tools specific to this project/workspace. Versioned in this repo, auto-discovered by pi.
 - **Global** (`~/.pi/agent/extensions/`): Tools needed across all projects. Symlinked or copied from `plugins/` when ready.
+
+## Deploying extensions
+
+List deployable plugins:
+
+```bash
+make list-plugins
+```
+
+Install all plugins globally for the current user:
+
+```bash
+make install
+```
+
+Install selected plugins globally:
+
+```bash
+make user-install PLUGINS="todo agent-teams"
+```
+
+Install selected plugins into another project's local pi extension directory:
+
+```bash
+make project-install PROJECT_DIR=/path/to/project PLUGINS="todo agent-teams"
+# alias:
+make make-project-install PROJECT_DIR=/path/to/project PLUGINS="todo agent-teams"
+```
+
+By default deployment copies files. Use `MODE=symlink` if you want installed extensions to track this checkout directly:
+
+```bash
+make install MODE=symlink
+```
 
 ## Secrets
 
