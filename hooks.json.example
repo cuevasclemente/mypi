@@ -1,20 +1,9 @@
 {
-  "monitors": [
+  "hooks": [
     {
-      "name": "install-extension",
-      "model": "openrouter/deepseek/deepseek-v4-flash",
-      "prompt": "You are monitoring a coding agent's output. Look for completion signals — phrases like 'Done', 'this is what we accomplished', 'final set of changes', 'everything should be finished', 'here is a summary of what was done', or similar wrap-up language. ONLY evaluate when these signals appear; if the agent is still mid-work and no completion signal is present, always return triggered: false regardless of content.\n\nWhen a completion signal is present, check if the agent created, wrote, or substantially modified files that look like new pi extensions. A pi extension is: a TypeScript file that exports a default function, likely in .pi/extensions/, ~/.pi/agent/extensions/, or the project root. Look for: registering tools (pi.registerTool), commands (pi.registerCommand), event handlers (pi.on), or custom UI components. Also watch for new agent definition .md files in .pi/agents/ or team definitions in .pi/teams/.\n\nIf the agent created a meaningful new extension, trigger. Do NOT trigger for: minor edits to existing extensions, bug fixes, tweaks, or non-extension code changes.\n\nRespond with ONLY a JSON object: {\"triggered\": true|false, \"reason\": \"what extension was created, or 'no completion signal' or 'no extension work detected'\"}.",
-      "message": "A new pi extension may have been created. If so, install it to the user context:\n- Copy .ts extension files to ~/.pi/agent/extensions/\n- Copy agent .md files to ~/.pi/agent/agents/\n- Copy team .md files to ~/.pi/agent/teams/\n\nThen verify with: `find ~/.pi/agent/extensions -name '*.ts' | sort`",
-      "minInterval": 2,
-      "maxContextTokens": 2000
-    },
-    {
-      "name": "journal-reminder",
-      "model": "openrouter/deepseek/deepseek-v4-flash",
-      "prompt": "You are monitoring a coding agent's output. Look for completion signals — phrases like 'Done', 'this is what we accomplished', 'final set of changes', 'everything should be finished', 'here is a summary of what was done', or similar wrap-up language. ONLY evaluate when these signals appear; if no completion signal is present, always return triggered: false regardless of content.\n\nWhen a completion signal is present, check if the agent completed meaningful, non-trivial work that should be documented. Meaningful work includes: building or shipping a feature, fixing a non-trivial bug, making architectural changes, discovering something important, or completing a significant task. Do NOT trigger for: minor typo fixes, trivial one-line changes, answering simple questions, or routine file reads.\n\nRespond with ONLY a JSON object: {\"triggered\": true|false, \"reason\": \"what was accomplished, or 'no completion signal' or 'no meaningful work detected'\"}.",
-      "message": "Significant work detected — consider journaling this session in memoriki: append to wiki/log.md and update wiki/index.md if new pages were created. Reason: {reason}",
-      "minInterval": 3,
-      "maxContextTokens": 2500
+      "name": "session-end-checklist",
+      "trigger": "session_start",
+      "message": "End-of-session checklist — this is injected at session start, but the items are meant to be done at THE END, after the user's final request is fully handled and just before you would otherwise stop responding. Do NOT act on these now. Remember them, then work through them at session end:\n\n- [ ] Journal the results of this session if something significant happened\n  - [ ] *If this session resulted in the creation or modification of pi extensions/features, don't forget to install them to the user's pi context (~/.pi/agent/extensions, /agents, /teams)*"
     }
   ]
 }
