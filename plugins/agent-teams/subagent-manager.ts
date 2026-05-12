@@ -78,7 +78,7 @@ interface AgentState {
 
 interface RpcRequest {
   type: string;
-  text?: string;
+  message?: string;
   images?: any[];
 }
 
@@ -89,8 +89,22 @@ function writeRpc(stdin: NodeJS.WritableStream | null, request: RpcRequest): voi
 
 // ── Subagent Manager ────────────────────────────────────────────────────────
 
+export type SubagentNotifyHandler = (agentId: string, content: string) => void;
+
 export class SubagentManager {
   private agents = new Map<string, AgentState>();
+  private notifyHandler?: SubagentNotifyHandler;
+
+  /**
+   * Set the handler called when a subagent's unsupervised turn finishes.
+   * "Unsupervised" means no `send()` call is awaiting a reply — e.g., the
+   * initial `sendAsync` from spawn, or a turn the subagent kicks off itself.
+   * The handler receives the subagent's final assistant message so the
+   * orchestrator can surface it without polling.
+   */
+  setNotifyHandler(handler: SubagentNotifyHandler | undefined): void {
+    this.notifyHandler = handler;
+  }
 
   // ── Tree helpers ───────────────────────────────────────────────────────
 
@@ -291,14 +305,25 @@ export class SubagentManager {
 
     if (event.type === "agent_end") {
       state.status = "idle";
+      const lastMsg = state.messages[state.messages.length - 1];
       if (state.pendingResolve) {
-        const lastMsg = state.messages[state.messages.length - 1] || {
-          role: "assistant" as const,
-          content: "(no response)",
-          timestamp: Date.now(),
-        };
-        state.pendingResolve(lastMsg);
+        // Someone is awaiting a reply (a `send` is pending) — deliver to them.
+        state.pendingResolve(
+          lastMsg ?? {
+            role: "assistant" as const,
+            content: "(no response)",
+            timestamp: Date.now(),
+          },
+        );
         state.pendingResolve = undefined;
+      } else if (lastMsg && lastMsg.role === "assistant" && lastMsg.content.trim() && this.notifyHandler) {
+        // Unsupervised turn finished (e.g., the initial sendAsync from spawn).
+        // Push the final message to the orchestrator so the human sees it without polling.
+        try {
+          this.notifyHandler(agentId, lastMsg.content);
+        } catch {
+          // ignore handler errors
+        }
       }
     }
   }
@@ -319,7 +344,7 @@ export class SubagentManager {
       state.pendingResolve = resolve;
 
       try {
-        writeRpc(state.process.stdin, { type: "prompt", text });
+        writeRpc(state.process.stdin, { type: "prompt", message: text });
       } catch (err: any) {
         state.status = "error";
         resolve({
@@ -339,7 +364,7 @@ export class SubagentManager {
       throw new Error(`Subagent "${agentId}" is ${state.status}`);
     }
     state.status = "running";
-    writeRpc(state.process.stdin, { type: "prompt", text });
+    writeRpc(state.process.stdin, { type: "prompt", message: text });
   }
 
   // ── Queries ────────────────────────────────────────────────────────────
@@ -516,21 +541,46 @@ export class SubagentManager {
     return 1 + this.getDescendants(agentId).length;
   }
 
-  /** Wait for a subagent to become idle */
-  async waitForIdle(agentId: string, timeoutMs: number = 300000): Promise<void> {
+  /** Wait for a subagent to become idle. Respects the provided AbortSignal for cancellation. */
+  async waitForIdle(
+    agentId: string,
+    timeoutMs: number = 300000,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const state = this.agents.get(agentId);
     if (!state) throw new Error(`Subagent "${agentId}" not found`);
     if (state.status === "idle" || state.status === "stopped") return;
 
     await new Promise<void>((resolve, reject) => {
+      let resolved = false;
+      const finish = (err?: Error) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeout);
+        if (signal && abortListener) signal.removeEventListener("abort", abortListener);
+        if (err) reject(err);
+        else resolve();
+      };
+
       const timeout = setTimeout(() => {
-        reject(new Error(`Timeout waiting for subagent "${agentId}"`));
+        finish(new Error(`Timeout waiting for subagent "${agentId}"`));
       }, timeoutMs);
 
+      const abortListener = signal
+        ? () => finish(new Error(`Wait for subagent "${agentId}" cancelled`))
+        : null;
+      if (signal) {
+        if (signal.aborted) {
+          finish(new Error(`Wait for subagent "${agentId}" cancelled`));
+          return;
+        }
+        signal.addEventListener("abort", abortListener!, { once: true });
+      }
+
       const check = () => {
+        if (resolved) return;
         if (state.status === "idle" || state.status === "stopped") {
-          clearTimeout(timeout);
-          resolve();
+          finish();
         } else {
           setTimeout(check, 100);
         }

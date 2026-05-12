@@ -3,6 +3,12 @@
  *
  * Handles process spawning, JSON event parsing, streaming updates,
  * usage tracking, and abort propagation.
+ *
+ * Identities are designed by the orchestrator at dispatch time:
+ * each task carries its own name + systemPrompt. There is no registry
+ * of predefined agent identities — the orchestrator is responsible for
+ * articulating the role, scope, and constraints for every subagent it
+ * dispatches.
  */
 
 import { spawn } from "node:child_process";
@@ -12,7 +18,6 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "./agents.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -26,9 +31,23 @@ export interface UsageStats {
   turns: number;
 }
 
+/**
+ * Identity for a one-shot subagent.
+ *
+ * `name` is a short label used in logs / display only. The orchestrator should
+ * choose something descriptive (e.g. "PdfScout-Downloads", "RouteAuditor").
+ * `systemPrompt` is the body that defines the subagent's role and constraints —
+ * it should be designed for the specific task at hand.
+ */
+export interface IdentitySpec {
+  name: string;
+  systemPrompt: string;
+  tools?: string[];
+  model?: string;
+}
+
 export interface SubagentResult {
   agent: string;
-  agentSource: "user" | "project" | "unknown";
   task: string;
   exitCode: number;
   messages: Message[];
@@ -42,8 +61,6 @@ export interface SubagentResult {
 
 export interface SubagentDetails {
   mode: "single" | "parallel" | "chain";
-  agentScope: string;
-  projectAgentsDir: string | null;
   results: SubagentResult[];
 }
 
@@ -154,11 +171,11 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 // ── Temp prompt file ──────────────────────────────────────────────────────
 
 async function writePromptToTempFile(
-  agentName: string,
+  name: string,
   prompt: string,
 ): Promise<{ dir: string; filePath: string }> {
   const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
+  const safeName = name.replace(/[^\w.-]+/g, "_");
   const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
   await withFileMutationQueue(filePath, async () => {
     await fs.promises.writeFile(filePath, prompt, {
@@ -173,8 +190,7 @@ async function writePromptToTempFile(
 
 export async function runSingleAgent(
   defaultCwd: string,
-  agents: AgentConfig[],
-  agentName: string,
+  identity: IdentitySpec,
   task: string,
   cwd: string | undefined,
   step: number | undefined,
@@ -182,38 +198,34 @@ export async function runSingleAgent(
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SubagentResult[]) => SubagentDetails,
 ): Promise<SubagentResult> {
-  const agent = agents.find((a) => a.name === agentName);
-
-  if (!agent) {
-    const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+  const trimmedPrompt = identity.systemPrompt?.trim() ?? "";
+  if (!trimmedPrompt) {
     return {
-      agent: agentName,
-      agentSource: "unknown",
+      agent: identity.name,
       task,
       exitCode: 1,
       messages: [],
-      stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
+      stderr: `Identity "${identity.name}" has empty system_prompt. The orchestrator must design the identity at creation time.`,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
       step,
     };
   }
 
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (agent.model) args.push("--model", agent.model);
-  if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+  if (identity.model) args.push("--model", identity.model);
+  if (identity.tools && identity.tools.length > 0) args.push("--tools", identity.tools.join(","));
 
   let tmpPromptDir: string | null = null;
   let tmpPromptPath: string | null = null;
 
   const currentResult: SubagentResult = {
-    agent: agentName,
-    agentSource: agent.source,
+    agent: identity.name,
     task,
     exitCode: 0,
     messages: [],
     stderr: "",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-    model: agent.model,
+    model: identity.model,
     step,
   };
 
@@ -229,12 +241,10 @@ export async function runSingleAgent(
   };
 
   try {
-    if (agent.systemPrompt.trim()) {
-      const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-      tmpPromptDir = tmp.dir;
-      tmpPromptPath = tmp.filePath;
-      args.push("--append-system-prompt", tmpPromptPath);
-    }
+    const tmp = await writePromptToTempFile(identity.name, trimmedPrompt);
+    tmpPromptDir = tmp.dir;
+    tmpPromptPath = tmp.filePath;
+    args.push("--append-system-prompt", tmpPromptPath);
 
     args.push(`Task: ${task}`);
     let wasAborted = false;
@@ -339,22 +349,24 @@ export async function runSingleAgent(
 
 // ── Parallel runner ───────────────────────────────────────────────────────
 
+export interface ParallelTask {
+  identity: IdentitySpec;
+  task: string;
+  cwd?: string;
+}
+
 export async function runParallelAgents(
-  tasks: Array<{ agent: string; task: string; cwd?: string }>,
+  tasks: ParallelTask[],
   defaultCwd: string,
-  agents: AgentConfig[],
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SubagentResult[]) => SubagentDetails,
 ): Promise<SubagentResult[]> {
-  // Track all results for streaming updates
   const allResults: SubagentResult[] = new Array(tasks.length);
 
-  // Initialize placeholder results
   for (let i = 0; i < tasks.length; i++) {
     allResults[i] = {
-      agent: tasks[i].agent,
-      agentSource: "unknown",
+      agent: tasks[i].identity.name,
       task: tasks[i].task,
       exitCode: -1,
       messages: [],
@@ -382,8 +394,7 @@ export async function runParallelAgents(
   const results = await mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (t, index) => {
     const result = await runSingleAgent(
       defaultCwd,
-      agents,
-      t.agent,
+      t.identity,
       t.task,
       t.cwd,
       undefined,
@@ -406,10 +417,15 @@ export async function runParallelAgents(
 
 // ── Chain runner ──────────────────────────────────────────────────────────
 
+export interface ChainStep {
+  identity: IdentitySpec;
+  task: string;
+  cwd?: string;
+}
+
 export async function runChainAgents(
-  chain: Array<{ agent: string; task: string; cwd?: string }>,
+  chain: ChainStep[],
   defaultCwd: string,
-  agents: AgentConfig[],
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SubagentResult[]) => SubagentDetails,
@@ -436,8 +452,7 @@ export async function runChainAgents(
 
     const result = await runSingleAgent(
       defaultCwd,
-      agents,
-      step.agent,
+      step.identity,
       taskWithContext,
       step.cwd,
       i + 1,

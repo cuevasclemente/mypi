@@ -1,182 +1,199 @@
 # Agent Teams Extension for Pi
 
-Agent teams and subagent orchestration for pi. The main pi agent IS the orchestrator — it spawns, communicates with, coordinates, and stops specialized subagents.
+Long-lived, stateful subagents for pi. The main pi agent IS the orchestrator — it designs, spawns, messages, polls, and stops subagents on demand.
+
+## Core Idea: Identity Is Designed, Not Selected
+
+There is **no registry of predefined agent identities**. Every subagent is brought into existence with a freshly-authored identity — a name and a system prompt — designed by the orchestrator for the specific task at hand.
+
+This is the central pattern of the extension. The orchestrator:
+
+1. **Names** the subagent for its role (`pdf-scout-downloads`, `route-auditor`, `migration-reviewer`).
+2. **Writes** a system prompt declaring the subagent's role, scope, constraints, and reporting format.
+3. **Spawns** the subagent with that identity and an initial task.
+4. (For long-lived work) **Messages** the subagent iteratively via `subagent_send`, **polls** with `subagent_poll`, and **stops** with `subagent_stop` when done.
+
+There are no `agent: "backend"` shortcuts. The orchestrator owns the identity design every time.
+
+> **New to agent teams?** The orchestrator's system prompt includes a skill (`agent-teams`) that teaches it how to use these tools effectively. See [SKILL.md](./SKILL.md) for the full guide.
 
 ## Architecture
 
 ```
 Main Pi Agent (Orchestrator)
    │
-   ├── subagent_spawn ──► Frontend Agent (RPC subprocess)
-   │                           │
-   │                           ├── Receives tasks via subagent_send
-   │                           ├── Reports progress via subagent_poll
-   │                           └── Stopped via subagent_stop
+   │  ──► designs identity at spawn time
+   │       (name + system_prompt tailored to task)
    │
-   ├── subagent_spawn ──► Backend Agent (RPC subprocess)
+   ├── subagent_spawn  ──► PdfScout-Downloads  (long-lived RPC subprocess)
+   │                        │
+   │                        ├── receives messages   via subagent_send
+   │                        ├── reports progress    via subagent_poll
+   │                        ├── sees active goals   (auto-injected into prompt)
+   │                        └── terminated          via subagent_stop
    │
-   ├── subagent_dispatch ──► One-shot parallel/chain agents
+   ├── subagent_spawn  ──► RouteAuditor          (long-lived RPC subprocess)
    │
-   └── goals_* ──► Goal tracking system
+   ├── subagent_dispatch ──► one-shot stateless subagents (single / parallel / chain)
+   │                          each with its own designed identity
+   │
+   └── goals_*            ──► goal tracking system
+                               (injected into subagent prompts)
 ```
 
 ## Tools
 
-### Subagent Management (long-lived, RPC-based)
-| Tool | Description |
-|------|-------------|
-| `subagent_spawn` | Create a subagent with system prompt + initial task |
-| `subagent_send` | Send a follow-up message to a subagent, wait for response |
-| `subagent_poll` | Check subagent status and retrieve new messages |
-| `subagent_stop` | Stop a subagent (cascading: stops children too) |
-| `subagent_list` | List all active subagents with tree structure |
+### Long-Lived, Stateful Subagents (RPC-based)
 
-### One-Shot Dispatch (stateless)
-| Tool | Description |
-|------|-------------|
-| `subagent_dispatch` | Dispatch tasks to agents (single, parallel, or chain mode) |
+| Tool             | Description                                                              |
+|------------------|--------------------------------------------------------------------------|
+| `subagent_spawn` | Spawn a long-lived subagent with a designed identity + initial task. Active goals and orchestrator model are auto-inherited. |
+| `subagent_send`  | Send a follow-up message to a subagent; wait for response                |
+| `subagent_poll`  | Check a subagent's status and retrieve new messages                      |
+| `subagent_stop`  | Stop a subagent (cascading: descendants stop too)                        |
+| `subagent_list`  | List all active subagents in tree form                                   |
+
+### One-Shot Dispatch (Stateless)
+
+| Tool                | Description                                                                |
+|---------------------|----------------------------------------------------------------------------|
+| `subagent_dispatch` | Run designed-identity subagents in single / parallel / chain mode. Model defaults to orchestrator's model. |
 
 ### Goals
-| Tool | Description |
-|------|-------------|
-| `goals_list` | List active goals |
-| `goals_add` | Add a goal (programmatic or qualitative) |
-| `goals_check` | Check programmatic goals by running their check commands |
-| `goals_update` | Update goal progress or mark complete |
-| `goals_remove` | Remove a goal |
+
+| Tool           | Description                                |
+|----------------|--------------------------------------------|
+| `goals_list`   | List active goals                          |
+| `goals_add`    | Add a goal (programmatic or qualitative)   |
+| `goals_check`  | Check programmatic goals by running checks |
+| `goals_update` | Update goal progress or mark complete      |
+| `goals_remove` | Remove a goal                              |
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/goals` | List active goals |
-| `/goals:add <desc> [\| <check cmd>]` | Add a goal |
-| `/goals:done <index>` | Mark a goal complete |
-| `/agents:list` | List available agent definitions |
-| `/teams:list` | List available team definitions |
-| `/subagents` | List active subagents (tree view) |
+| Command              | Description                              |
+|----------------------|------------------------------------------|
+| `/goals`             | List active goals                        |
+| `/goals:add`         | Add a goal (`desc` or `desc \| check`)   |
+| `/goals:done <n>`    | Mark goal #n complete                    |
+| `/subagents`         | List active subagents (tree view)        |
 
-## Agent Definitions
+## Key Behaviors
 
-Agents are defined in `.pi/agents/*.md` with YAML frontmatter:
+### Shared Goals
 
-```markdown
----
-name: frontend
-description: Frontend/UI specialist
-tools: read, bash, edit, write, grep, find, ls
-model: claude-sonnet-4-5
----
+Active goals (created with `goals_add`) are automatically injected into subagent system prompts when spawned. Each subagent sees the current goals and can work towards them. The orchestrator should:
 
-System prompt body here...
+1. Define goals before spawning subagents
+2. Poll subagents and check responses for progress indicators
+3. Run `goals_check` after subagents complete to verify programmatic goals
+4. Use `goals_update` to record progress on qualitative goals
+
+### Model Inheritance
+
+Subagents and dispatched agents inherit the orchestrator's current model by default. Only override the model when:
+
+- The user explicitly asks for a specific model
+- A task needs a cheaper/faster model (simple searches, grep work)
+- A task needs special capabilities (vision, etc.)
+
+Model overrides use the same format as pi's `--model` flag: `provider/model-id` (e.g., `openrouter/deepseek/deepseek-v4-flash`).
+
+### Tool Restrictions
+
+Subagents can be restricted to specific tools via the `tools` parameter. This is a comma-separated list of tool names:
+
+- `"read, bash"` — read-only access
+- `"read, bash, edit, write, grep, find, ls"` — full coding access
+- Omit for the default tool set
+
+## Designing an Identity
+
+A subagent's identity is a contract. The orchestrator writes it; the subagent inherits it.
+
+A well-designed identity answers four questions:
+
+1. **Who is this subagent?** (a one-line role)
+2. **What does it own?** (the scope of its work)
+3. **What must it not do?** (constraints — usually narrower than the orchestrator's defaults)
+4. **How does it report back?** (the shape of the response the orchestrator expects)
+
+### Example: a single stateful subagent
+
+```
+subagent_spawn(
+  id: "PdfScout-Downloads",
+  system_prompt: |
+    You are PdfScout-Downloads. You inventory PDF files under ~/Downloads.
+
+    Scope:
+      - Search ~/Downloads recursively for files ending in .pdf (case-insensitive).
+      - Capture the path, size, and modification time for each.
+
+    Constraints:
+      - Do NOT modify, move, or delete any files.
+      - Do NOT follow symlinks outside ~/Downloads.
+      - Do NOT search other directories.
+
+    Report:
+      - A bullet list of PDF paths, one per line, with size and mtime.
+      - If 0 PDFs, say "no PDFs in ~/Downloads".
+
+  task: "Inventory all PDFs under ~/Downloads."
+)
 ```
 
-### Included Agents
-- **frontend** — UI components, styling, client-side logic
-- **backend** — APIs, business logic, authentication
-- **database** — Schema design, migrations, queries
-- **infra** — Docker, CI/CD, cloud config
-- **deployment** — Release management, production operations
-- **architect** — System design and team orchestration
+### Example: a parallel team
 
-## Team Definitions
+The orchestrator splits a large search across multiple subagents, designing a distinct identity for each region:
 
-Teams are defined in `.pi/teams/*.md` with YAML frontmatter:
-
-```markdown
----
-name: full-stack
-description: Full-stack development team
-agents: frontend, backend, database
-orchestrator: architect
----
-
-Optional team-level context...
+```
+subagent_dispatch(tasks=[
+  { name: "PdfScout-Documents",
+    system_prompt: "You inventory PDFs under ~/Documents. ...",
+    task: "Inventory PDFs in ~/Documents." },
+  { name: "PdfScout-Downloads",
+    system_prompt: "You inventory PDFs under ~/Downloads. ...",
+    task: "Inventory PDFs in ~/Downloads." },
+  { name: "PdfScout-Projects",
+    system_prompt: "You inventory PDFs under ~/projects. ...",
+    task: "Inventory PDFs in ~/projects." },
+])
 ```
 
-### Included Teams
-- **full-stack** — Frontend + Backend + Database
-- **infra-deploy** — Infrastructure + Deployment
+The names are descriptive so the orchestrator can disambiguate results. The system prompts are tailored — for instance, `PdfScout-Projects` might be told to skip `node_modules` and `.git`, while `PdfScout-Documents` would not need that constraint.
 
-## Goals
+## Usage Patterns
 
-Goals are long-horizon objectives that guide agent team workflows.
-
-### Programmatic Goals
-Have a check command that exits 0 when the goal is met:
-```
-/goals:add All tests passing | npm test
-```
-
-### Qualitative Goals
-Described in text, manually updated:
-```
-/goals:add Ensure consistent error handling across all API routes
-```
-
-Goals are automatically checked via `goals_check` and appear in the orchestrator's system prompt context.
+See [SKILL.md](./SKILL.md) for detailed patterns including:
+- Parallel Reconnaissance
+- Iterative Refinement
+- One-Shot Parallel/Chain
+- Goal-Driven Workflows
 
 ## Cascading Stop
 
-When `subagent_stop` is called on a parent subagent, ALL descendants are stopped recursively. This ensures clean teardown of agent trees.
+When `subagent_stop` is called on a parent subagent, ALL descendants stop recursively:
 
 ```
 Orchestrator
-  └─ backend-1         ← stopping this...
-       └─ db-helper-1   ← also stops this
-       └─ db-helper-2   ← also stops this
-```
-
-## Usage
-
-### Parallel Dispatch
-```
-Use subagent_dispatch to run the frontend and backend agents in parallel:
-- frontend: Build the login page component
-- backend: Add the /api/auth/login endpoint
-```
-
-### Coordinated Team Work
-```
-Spawn a backend agent, send it the API spec, poll for progress,
-send follow-up with review feedback, then stop it.
-```
-
-### Goal-Driven Workflow
-```
-/goals:add All API endpoints have tests | npm test -- --coverage --testPathPattern=api
-/goals:add Consistent error response format
-
-Then use the full-stack team to implement API changes.
-The orchestrator will check goals after dispatching work.
+  └─ backend-reviewer     ← stop this...
+       └─ migration-checker  ← also stops
+       └─ test-runner        ← also stops
 ```
 
 ## File Structure
 
 ```
-.pi/
-├── extensions/
-│   └── agent-teams/
-│       ├── index.ts              # Entry point — registers all tools + commands
-│       ├── agents.ts             # Agent discovery from .md files
-│       ├── teams.ts              # Team discovery from .md files
-│       ├── goals.ts              # Goal management utilities
-│       ├── subagent-manager.ts   # RPC subprocess lifecycle manager
-│       └── subagent-runner.ts    # One-shot dispatch runner
-├── agents/
-│   ├── frontend.md
-│   ├── backend.md
-│   ├── database.md
-│   ├── infra.md
-│   ├── deployment.md
-│   └── architect.md
-└── teams/
-    ├── full-stack.md
-    └── infra-deploy.md
+plugins/agent-teams/
+├── SKILL.md              # Orchestrator skill — teaches the LLM how to use agent teams
+├── README.md             # This file — technical reference for developers
+├── index.ts              # Entry point — registers all tools + commands
+├── goals.ts              # Goal management utilities
+├── subagent-manager.ts   # RPC subprocess lifecycle (long-lived agents)
+└── subagent-runner.ts    # One-shot dispatch runner
 ```
 
-## Subagents with Subagents
+## Nesting
 
-Subagents can be nested: a parent subagent can have child subagents. All children are automatically stopped when the parent is stopped. The main orchestrator (your pi session) is the root of all agent trees.
-
-For subagents to spawn their own children autonomously, pass the extension to subprocesses (future enhancement).
+Subagents can spawn their own children. The orchestrator (your main pi session) is the root of every tree. When a parent stops, its children stop too. For a subagent to spawn its own children, the extension must be available in its subprocess (configured separately).

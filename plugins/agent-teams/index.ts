@@ -1,41 +1,35 @@
 /**
  * Agent Teams Extension
  *
- * Provides subagent management and agent team orchestration for pi.
+ * Provides subagent management and orchestration for pi.
  *
  * Architecture:
  *   - The main pi agent IS the orchestrator.
  *   - Subagents are spawned as long-lived pi RPC subprocesses.
  *   - The orchestrator spawns, messages, polls, and stops subagents.
- *   - Agent teams are defined in .pi/teams/*.md
+ *   - Identities are designed by the orchestrator at creation time —
+ *     there is NO registry of predefined agent identities. Every
+ *     spawn/dispatch carries a freshly-authored name + system prompt
+ *     tailored to the task.
  *   - Goals guide long-horizon workflows.
  *
  * Tools:
- *   - subagent_spawn  : Create a subagent with a spec + initial prompt
- *   - subagent_send   : Send a message to a subagent
- *   - subagent_poll   : Poll a subagent for new messages/output
- *   - subagent_stop   : Stop a subagent
- *   - subagent_list   : List all running subagents
+ *   - subagent_spawn    : Create a long-lived subagent with a designed identity
+ *   - subagent_send     : Send a message to a subagent
+ *   - subagent_poll     : Poll a subagent for new messages/output
+ *   - subagent_stop     : Stop a subagent
+ *   - subagent_list     : List all running subagents
  *   - subagent_dispatch : One-shot parallel/chain dispatch (stateless)
- *   - goals_*          : Goal management tools
+ *   - goals_*           : Goal management tools
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import {
-  type AgentScope,
-  discoverAgents,
-  formatAgentList,
-} from "./agents.js";
 import {
   type Goal,
   formatGoalsForPrompt,
 } from "./goals.js";
-import {
-  discoverTeams,
-} from "./teams.js";
 import {
   SubagentManager,
   type SubagentSpec,
@@ -44,6 +38,7 @@ import {
   runParallelAgents,
   runChainAgents,
   runSingleAgent,
+  type IdentitySpec,
   type SubagentDetails,
   type SubagentResult,
   formatUsageStats,
@@ -58,6 +53,33 @@ export default function (pi: ExtensionAPI) {
   const subagentManager = new SubagentManager();
   let goals: Goal[] = [];
   let nextGoalId = 1;
+
+  // Wire up subagent → orchestrator notifications.
+  // When a subagent prefixes its output with [NOTIFY], the message is queued
+  // for the orchestrator's next turn so it sees it without polling.
+  subagentManager.setNotifyHandler((agentId, content) => {
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent-notify",
+          content: `[from subagent: ${agentId}]\n${content}`,
+          display: true,
+          details: { agentId, content },
+        },
+        { deliverAs: "nextTurn" },
+      );
+    } catch {
+      // ignore — sendMessage may throw if session is shutting down
+    }
+  });
+
+  pi.registerMessageRenderer("subagent-notify", (message, _options, theme) => {
+    const details = (message as any).details as { agentId?: string; content?: string } | undefined;
+    const agentId = details?.agentId ?? "subagent";
+    const body = details?.content ?? message.content;
+    const header = theme.fg("accent", theme.bold(`↑ notify from "${agentId}"`));
+    return new Text(`${header}\n${theme.fg("toolOutput", body)}`, 0, 0);
+  });
 
   // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -176,39 +198,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("agents:list", {
-    description: "List available agents",
-    handler: async (_args, ctx) => {
-      const discovery = discoverAgents(ctx.cwd, "both");
-      if (discovery.agents.length === 0) {
-        ctx.ui.notify("No agents found. Create .pi/agents/*.md files.", "info");
-        return;
-      }
-      const lines = discovery.agents
-        .map((a) => `${a.name} (${a.source}): ${a.description}${a.model ? ` [model: ${a.model}]` : ""}`)
-        .join("\n");
-      ctx.ui.notify(`Available Agents:\n\n${lines}`, "info");
-    },
-  });
-
-  pi.registerCommand("teams:list", {
-    description: "List available teams",
-    handler: async (_args, ctx) => {
-      const discovery = discoverTeams(ctx.cwd, "both");
-      if (discovery.teams.length === 0) {
-        ctx.ui.notify("No teams found. Create .pi/teams/*.md files.", "info");
-        return;
-      }
-      const lines = discovery.teams
-        .map(
-          (t) =>
-            `${t.name} (${t.source}): ${t.description}\n  Agents: ${t.agents.join(", ")}\n  Orchestrator: ${t.orchestrator}`,
-        )
-        .join("\n\n");
-      ctx.ui.notify(`Teams:\n\n${lines}`, "info");
-    },
-  });
-
   pi.registerCommand("subagents", {
     description: "List active subagents",
     handler: async (_args, ctx) => {
@@ -229,60 +218,149 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Style-specific spawn-time guidance ──────────────────────────────────────────
+
+  type SpawnStyle = "team-member" | "worker" | "minimal";
+
+  /**
+   * Produce the spawn-time augmentation appended to a subagent's system prompt.
+   * Every style includes the universal end-of-turn-message-is-your-reply rule.
+   * Beyond that, each style adds the coaching appropriate to its pattern.
+   */
+  function styleGuidance(style: SpawnStyle): string {
+    const universal = [
+      "",
+      "",
+      "## Reporting Back",
+      "You are a subagent in a team coordinated by an orchestrator.",
+      "",
+      "At the end of each of your turns, your final assistant message is automatically delivered to whoever is listening:",
+      "- If the orchestrator (or a teammate) is awaiting a direct reply to a message they sent you, your final message goes to them.",
+      "- Otherwise (e.g., the initial task you were spawned with, or a turn you initiated), your final message is surfaced in the orchestrator's chat.",
+      "",
+      "Always end your turn with a clear, useful final message. That IS your report. Do not invent special markers or prefixes — the plumbing is automatic. Be concise; long monologues clutter the orchestrator's view.",
+    ];
+
+    if (style === "minimal") {
+      return universal.join("\n");
+    }
+
+    if (style === "worker") {
+      return universal
+        .concat([
+          "",
+          "## Working Style: Service Worker",
+          "You are a service-style worker, not a project owner. The orchestrator owns the decomposition; you handle one request at a time and reply to each one.",
+          "",
+          "How to operate:",
+          "- After your initial acknowledgement, idle. Wait for the next message.",
+          "- Each incoming message is a single, scoped request. Do exactly what is asked, nothing more.",
+          "- Reply tersely. Confirmation, key result, file path written — that's usually enough.",
+          "- If a request is ambiguous or out of your scope, say so briefly and stop. Do not improvise around it.",
+          "- Do NOT create your own goal list. Goals don't fit this pattern — there is no project, just a stream of small requests.",
+          "- Do NOT spawn your own subagents. You are a leaf in the tree.",
+          "",
+          "A good per-request reply often looks like:",
+          "```",
+          "Defined `serendipity` → ~/dict/serendipity.txt: <one-sentence definition>",
+          "```",
+        ])
+        .join("\n");
+    }
+
+    // team-member (default)
+    return universal
+      .concat([
+        "",
+        "## Working Style: Team Member",
+        "You own a substantial task. The orchestrator handed you a goal; you decide how to break it down and execute it.",
+        "",
+        "## Tracking Your Own Work With Goals",
+        "You have access to the same `goals_add` / `goals_check` / `goals_update` / `goals_list` tools the orchestrator has. Your goal list is *your own* (independent of the orchestrator's).",
+        "",
+        "You are strongly encouraged to create your own goals as soon as you receive a non-trivial task:",
+        "- Decompose the task into 2–6 concrete goals.",
+        "- Use `check_command` for any goal that can be programmatically verified (file exists, test passes, grep finds X). Use qualitative goals for the rest.",
+        "- As you work, run `goals_check` to see which programmatic goals have flipped to done.",
+        "- Mark qualitative goals complete via `goals_update` when you finish them.",
+        "",
+        "Why this matters: at the end of each turn, your goal list is the natural skeleton of your report. Instead of inventing structure on the fly, glance at your goals and tell the orchestrator: which ones are done, which ones are blocked, which ones are still open. This makes your final message clear, honest, and easy for the orchestrator to act on.",
+        "",
+        "A good final message often looks like:",
+        "```",
+        "Done with the assigned work.",
+        "✓ Goal 1: <short description> — verified by <check>",
+        "✓ Goal 2: <short description>",
+        "✗ Goal 3: <short description> — blocked because <reason>",
+        "… Goal 4: <short description> — still in progress; next step is <X>",
+        "```",
+      ])
+      .join("\n");
+  }
+
   // ── Tool: subagent_spawn ───────────────────────────────────────────────
 
   pi.registerTool({
     name: "subagent_spawn",
     label: "Spawn Subagent",
     description: [
-      "Spawn a new subagent as a long-lived process.",
-      "The subagent will run autonomously and can receive follow-up messages.",
-      "Use agent name defined in agent definitions, or provide a custom system prompt.",
+      "Spawn a new subagent as a long-lived process with a designed identity.",
+      "The subagent runs autonomously in the background — spawn returns immediately.",
+      "Send follow-up messages via subagent_send, poll for output via subagent_poll.",
+      "There are NO predefined agent identities — you MUST design the subagent's identity",
+      "at spawn time by writing a system_prompt that articulates its role, scope, and constraints.",
     ].join(" "),
-    promptSnippet: "Spawn a new subagent with a system prompt and initial task",
+    promptSnippet: "Spawn a long-lived subagent with a custom-designed identity and an initial task (returns immediately — use poll to check progress)",
     promptGuidelines: [
-      "Use subagent_spawn to create specialized agents for long-running parallel work.",
-      "Use subagent_send to communicate with spawned subagents.",
-      "Use subagent_poll to check on subagent progress.",
-      "Use subagent_stop to terminate subagents when done.",
+      "Design each subagent's identity for the specific task. The system_prompt should declare WHO this subagent is, WHAT it owns, and WHAT it must not do.",
+      "Choose a descriptive id that reflects the role (e.g., 'pdf-scout-downloads', not 'agent-1').",
+      "Subagents inherit no role memory — every spawn is a fresh identity.",
+      "Spawn returns immediately — the subagent works in the background. Spawn ALL subagents first, then use subagent_poll to check progress.",
+      "Active goals are automatically injected into the subagent's context. Use goals_add before spawning to define objectives.",
+      "The subagent inherits your current model by default. Only override model when the user asks for a specific model or when the task needs special capabilities.",
+      "Use subagent_send to communicate iteratively, subagent_poll to check progress, subagent_stop when done.",
+      "For one-shot stateless work, prefer subagent_dispatch.",
+      "Pick a `style` that matches the pattern: 'team-member' (default) for substantive owned work that decomposes into goals; 'worker' for narrow request/reply roles like a dictionary or thesaurus that don't have a project to plan; 'minimal' when your system_prompt already says everything needed and you want no auto-injected coaching.",
     ],
     parameters: Type.Object({
-      id: Type.String({ description: "Unique ID for this subagent (e.g., 'frontend-1')" }),
+      id: Type.String({
+        description:
+          "Unique, descriptive ID for this subagent (e.g., 'pdf-scout-downloads'). Used for routing messages.",
+      }),
       parent_id: Type.Optional(
         Type.String({ description: "Parent subagent ID if spawned from another subagent" }),
       ),
-      agent: Type.Optional(Type.String({ description: "Name of a defined agent to use" })),
-      system_prompt: Type.Optional(
-        Type.String({ description: "Custom system prompt (if no agent name specified)" }),
-      ),
+      system_prompt: Type.String({
+        description:
+          "REQUIRED. The system prompt that designs this subagent's identity — its role, scope, constraints, and reporting format. Write it fresh for each spawn; do not assume a registry of predefined identities.",
+      }),
       task: Type.String({ description: "Initial task for the subagent" }),
       tools: Type.Optional(Type.String({ description: "Comma-separated tool names to allow" })),
-      model: Type.Optional(Type.String({ description: "Model override for the subagent" })),
+      model: Type.Optional(Type.String({ description: "Model override for the subagent. Defaults to the orchestrator's current model." })),
       cwd: Type.Optional(Type.String({ description: "Working directory for the subagent" })),
+      style: Type.Optional(
+        Type.Union(
+          [Type.Literal("team-member"), Type.Literal("worker"), Type.Literal("minimal")],
+          {
+            description:
+              "Coaching style for this subagent. 'team-member' (default): owns a substantial task, decomposes it into its own goals, reports goal-shaped status. 'worker': narrow role serving requests one-at-a-time, no goals, terse per-request replies. 'minimal': only the universal end-of-turn-message-is-your-reply rule; orchestrator owns all other guidance via system_prompt.",
+          },
+        ),
+      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const discovery = discoverAgents(ctx.cwd, "both");
-      let systemPrompt: string;
-      let agentName: string;
-
-      if (params.agent) {
-        const agent = discovery.agents.find((a) => a.name === params.agent);
-        if (!agent) {
-          const available = discovery.agents.map((a) => `"${a.name}"`).join(", ");
-          return {
-            content: [{ type: "text", text: `Agent "${params.agent}" not found. Available: ${available || "none"}` }],
-            details: {},
-          };
-        }
-        systemPrompt = agent.systemPrompt;
-        agentName = agent.name;
-      } else if (params.system_prompt) {
-        systemPrompt = params.system_prompt;
-        agentName = params.id;
-      } else {
+      const systemPrompt = params.system_prompt?.trim();
+      if (!systemPrompt) {
         return {
-          content: [{ type: "text", text: "Must specify either 'agent' name or 'system_prompt'" }],
+          content: [
+            {
+              type: "text",
+              text:
+                "subagent_spawn requires a non-empty 'system_prompt'. Design the subagent's identity (role, scope, constraints) explicitly at creation time — there are no predefined identities to reference.",
+            },
+          ],
           details: {},
+          isError: true,
         };
       }
 
@@ -295,30 +373,46 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // Inject active goals into the subagent's system prompt
+      const activeGoals = goals.filter((g) => !g.completed);
+      let enrichedPrompt = systemPrompt;
+      if (activeGoals.length > 0) {
+        const goalsContext = formatGoalsForPrompt(activeGoals);
+        enrichedPrompt = `${systemPrompt}\n\n## Active Team Goals\nThe following goals are being tracked by the orchestrator. Work towards these goals as applicable to your scope.\n\n${goalsContext}`;
+      }
+
+      // Teach the subagent how reporting works (style-dependent).
+      const style: SpawnStyle = (params.style as SpawnStyle | undefined) ?? "team-member";
+      enrichedPrompt += styleGuidance(style);
+
+      // Default model: use orchestrator's model if not specified
+      const orchestratorModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      const model = params.model || orchestratorModel;
+
       const spec: SubagentSpec = {
         id: params.id,
         parentId: params.parent_id,
-        agentName,
-        systemPrompt,
+        agentName: params.id,
+        systemPrompt: enrichedPrompt,
         tools: params.tools,
-        model: params.model,
+        model,
         cwd: params.cwd || ctx.cwd,
       };
 
       try {
         const status = await subagentManager.spawn(spec);
 
-        // Send initial task
-        const response = await subagentManager.send(params.id, params.task);
+        // Send initial task as fire-and-forget so multiple subagents can be spawned in parallel.
+        // Use subagent_poll to check progress and get responses.
+        await subagentManager.sendAsync(params.id, params.task);
 
         const updatedStatus = subagentManager.getStatus(params.id);
-        const responseText = response?.content || "(awaiting response...)";
 
         return {
           content: [
             {
               type: "text",
-              text: `Subagent "${spec.id}" (${spec.agentName}) spawned${spec.parentId ? ` as child of "${spec.parentId}"` : ""}.\nStatus: ${updatedStatus.status}\nInitial response:\n${responseText}`,
+              text: `Subagent "${spec.id}" (${spec.agentName}) spawned${spec.parentId ? ` as child of "${spec.parentId}"` : ""}.\nStatus: ${updatedStatus.status}\nUse subagent_poll to check progress and retrieve output.`,
             },
           ],
           details: { status: updatedStatus },
@@ -333,13 +427,10 @@ export default function (pi: ExtensionAPI) {
     },
     renderCall(args, theme, _context) {
       const id = args.id || "...";
-      const agent = args.agent || "(custom)";
       const parentStr = args.parent_id ? theme.fg("muted", ` child of ${args.parent_id}`) : "";
       const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-      let text = theme.fg("toolTitle", theme.bold("spawn ")) +
-        theme.fg("accent", id) +
-        theme.fg("muted", ` (${agent})`) +
-        parentStr;
+      let text =
+        theme.fg("toolTitle", theme.bold("spawn ")) + theme.fg("accent", id) + parentStr;
       text += `\n  ${theme.fg("dim", preview)}`;
       return new Text(text, 0, 0);
     },
@@ -430,11 +521,13 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Check a subagent's status and retrieve new messages since last poll.",
       "Pass no 'id' to poll all subagents.",
+      "Set wait:true with an id to block until the subagent finishes, then return full output.",
       "The orchestrator should poll subagents to monitor their progress.",
     ].join(" "),
     promptSnippet: "Check subagent status and retrieve new messages",
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Subagent ID to poll. Omit to poll all." })),
+      wait: Type.Optional(Type.Boolean({ description: "If true, block until the subagent is idle, then return full output. Only valid when 'id' is provided." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (params.id) {
@@ -450,6 +543,37 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
+        // If wait is requested, block until idle, then return full output
+        if (params.wait) {
+          try {
+            await subagentManager.waitForIdle(params.id, 300000, signal); // 5 min timeout, abortable
+          } catch (err: any) {
+            const status = subagentManager.getStatus(params.id);
+            return {
+              content: [{ type: "text", text: `${err.message}. Current status: ${status.status} (${status.messages.length} msgs).` }],
+              details: { status },
+              isError: true,
+            };
+          }
+
+          const status = subagentManager.getStatus(params.id);
+          const allMsgs = status.messages;
+          const msgText = allMsgs
+            .map((m) => `[${m.role}] ${m.content}`)
+            .join("\n\n");
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `## ${params.id} (${status.agentName}) — COMPLETE\nStatus: ${status.status}\nMessages: ${status.messages.length}\n\n${msgText || "(no output)"}`,
+              },
+            ],
+            details: { status },
+          };
+        }
+
+        // Quick poll — return recent messages
         const status = subagentManager.getStatus(params.id);
         const latestMsgs = status.messages.slice(-5);
         const msgText = latestMsgs
@@ -618,90 +742,133 @@ export default function (pi: ExtensionAPI) {
 
   // ── Tool: subagent_dispatch (one-shot parallel/chain) ──────────────────
 
+  const IdentityFields = {
+    name: Type.String({
+      description:
+        "Short, descriptive label for this subagent (used in logs/UI), e.g. 'PdfScout-Downloads'.",
+    }),
+    system_prompt: Type.String({
+      description:
+        "Designed system prompt for this subagent. Articulate its role, scope, and constraints — there are no predefined identities to reference.",
+    }),
+    task: Type.String({ description: "Task to delegate" }),
+    tools: Type.Optional(Type.String({ description: "Comma-separated tool names to allow" })),
+    model: Type.Optional(Type.String({ description: "Model override for this subagent. Defaults to the orchestrator's current model." })),
+    cwd: Type.Optional(Type.String({ description: "Working directory for the subprocess" })),
+  };
+
   const TaskItem = Type.Object({
-    agent: Type.String({ description: "Name of the agent to invoke" }),
-    task: Type.String({ description: "Task to delegate to the agent" }),
-    cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+    name: IdentityFields.name,
+    system_prompt: IdentityFields.system_prompt,
+    task: IdentityFields.task,
+    tools: IdentityFields.tools,
+    model: IdentityFields.model,
+    cwd: IdentityFields.cwd,
   });
 
   const ChainItem = Type.Object({
-    agent: Type.String({ description: "Name of the agent to invoke" }),
-    task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-    cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+    name: IdentityFields.name,
+    system_prompt: IdentityFields.system_prompt,
+    task: Type.String({
+      description: "Task. May include {previous} placeholder for prior step's output.",
+    }),
+    tools: IdentityFields.tools,
+    model: IdentityFields.model,
+    cwd: IdentityFields.cwd,
   });
 
-  const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-    description: 'Which agent directories to use. Default: "both".',
-    default: "both",
-  });
+  const parseTools = (tools?: string): string[] | undefined => {
+    if (!tools) return undefined;
+    const parsed = tools.split(",").map((t) => t.trim()).filter(Boolean);
+    return parsed.length > 0 ? parsed : undefined;
+  };
 
   pi.registerTool({
     name: "subagent_dispatch",
     label: "Dispatch Subagents",
     description: [
-      "Dispatch tasks to subagents for one-shot execution (single, parallel, or chain).",
-      "Use this for stateless parallel work that doesn't need ongoing communication.",
-      "Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-      "For long-lived subagents with ongoing communication, use subagent_spawn/send/poll/stop.",
+      "Dispatch tasks to one-shot subagents (single, parallel, or chain).",
+      "Each task carries its own designed identity (name + system_prompt) — there are NO predefined identities.",
+      "Use this for stateless work that doesn't need ongoing communication.",
+      "For long-lived subagents with iterative messaging, use subagent_spawn/send/poll/stop.",
     ].join(" "),
-    promptSnippet: "Dispatch one-shot tasks to subagents (single, parallel, or chain)",
+    promptSnippet: "Dispatch one-shot subagents with custom-designed identities (single, parallel, or chain)",
     promptGuidelines: [
-      "Use subagent_dispatch for one-off parallel or sequential task execution.",
-      "For ongoing agent coordination, use subagent_spawn to create long-lived agents.",
-      "Use chain mode when subtasks depend on each other (pass context via {previous}).",
+      "Design each subagent's identity at dispatch time: write a system_prompt that defines role, scope, and constraints for the specific task.",
+      "Choose descriptive names (e.g., 'RouteAuditor', 'PdfScout-Downloads') — they appear in logs and help you track which subagent produced which result.",
+      "Use parallel mode when subtasks are independent.",
+      "Use chain mode when later steps depend on earlier output — pass context via the {previous} placeholder.",
+      "Each subagent inherits your current model by default. Only override model when needed.",
+      "For ongoing back-and-forth with a stateful subagent, use subagent_spawn instead.",
     ],
     parameters: Type.Object({
-      agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
-      task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+      name: Type.Optional(IdentityFields.name),
+      system_prompt: Type.Optional(IdentityFields.system_prompt),
+      task: Type.Optional(IdentityFields.task),
+      tools: Type.Optional(IdentityFields.tools),
+      model: Type.Optional(IdentityFields.model),
+      cwd: Type.Optional(IdentityFields.cwd),
       tasks: Type.Optional(
-        Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" }),
+        Type.Array(TaskItem, {
+          description: "Array of {name, system_prompt, task, ...} for parallel execution",
+        }),
       ),
       chain: Type.Optional(
-        Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" }),
+        Type.Array(ChainItem, {
+          description: "Array of {name, system_prompt, task, ...} for sequential execution",
+        }),
       ),
-      agentScope: Type.Optional(AgentScopeSchema),
-      cwd: Type.Optional(Type.String({ description: "Working directory (single mode)" })),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const agentScope: AgentScope = params.agentScope ?? "both";
-      const discovery = discoverAgents(ctx.cwd, agentScope);
-      const agents = discovery.agents;
-
       const hasChain = (params.chain?.length ?? 0) > 0;
       const hasTasks = (params.tasks?.length ?? 0) > 0;
-      const hasSingle = Boolean(params.agent && params.task);
+      const hasSingle = Boolean(params.name && params.system_prompt && params.task);
       const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
       const makeDetails =
         (mode: "single" | "parallel" | "chain") =>
         (results: SubagentResult[]): SubagentDetails => ({
           mode,
-          agentScope,
-          projectAgentsDir: discovery.projectAgentsDir,
           results,
         });
 
       if (modeCount !== 1) {
-        const available = formatAgentList(agents, 5);
         return {
           content: [
             {
               type: "text",
-              text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available.text}${available.remaining > 0 ? ` (+${available.remaining} more)` : ""}`,
+              text:
+                "Invalid parameters. Provide exactly one mode:\n" +
+                "  • single: name + system_prompt + task\n" +
+                "  • parallel: tasks: [{name, system_prompt, task}, ...]\n" +
+                "  • chain: chain: [{name, system_prompt, task}, ...]\n\n" +
+                "Each task must carry its own designed identity (no predefined identities exist).",
             },
           ],
           details: makeDetails("single")([]),
+          isError: true,
         };
       }
 
+      // ── Helper: resolve model with orchestrator default ──
+      const resolveModel = (explicit?: string): string | undefined => {
+        if (explicit) return explicit;
+        return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      };
+
       // ── Single mode ──
-      if (params.agent && params.task) {
+      if (hasSingle) {
+        const identity: IdentitySpec = {
+          name: params.name!,
+          systemPrompt: params.system_prompt!,
+          tools: parseTools(params.tools),
+          model: resolveModel(params.model),
+        };
         const result = await runSingleAgent(
           ctx.cwd,
-          agents,
-          params.agent,
-          params.task,
+          identity,
+          params.task!,
           params.cwd,
           undefined,
           signal,
@@ -729,23 +896,32 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Parallel mode ──
-      if (params.tasks && params.tasks.length > 0) {
-        if (params.tasks.length > MAX_PARALLEL_TASKS) {
+      if (hasTasks) {
+        if (params.tasks!.length > MAX_PARALLEL_TASKS) {
           return {
             content: [
               {
                 type: "text",
-                text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+                text: `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.`,
               },
             ],
             details: makeDetails("parallel")([]),
+            isError: true,
           };
         }
 
         const results = await runParallelAgents(
-          params.tasks.map((t) => ({ agent: t.agent, task: t.task, cwd: t.cwd })),
+          params.tasks!.map((t) => ({
+            identity: {
+              name: t.name,
+              systemPrompt: t.system_prompt,
+              tools: parseTools(t.tools),
+              model: resolveModel(t.model),
+            },
+            task: t.task,
+            cwd: t.cwd,
+          })),
           ctx.cwd,
-          agents,
           signal,
           onUpdate,
           makeDetails("parallel"),
@@ -769,78 +945,71 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Chain mode ──
-      if (params.chain && params.chain.length > 0) {
-        const results = await runChainAgents(
-          params.chain.map((c) => ({ agent: c.agent, task: c.task, cwd: c.cwd })),
-          ctx.cwd,
-          agents,
-          signal,
-          onUpdate,
-          makeDetails("chain"),
-        );
+      const results = await runChainAgents(
+        params.chain!.map((c) => ({
+          identity: {
+            name: c.name,
+            systemPrompt: c.system_prompt,
+            tools: parseTools(c.tools),
+            model: resolveModel(c.model),
+          },
+          task: c.task,
+          cwd: c.cwd,
+        })),
+        ctx.cwd,
+        signal,
+        onUpdate,
+        makeDetails("chain"),
+      );
 
-        const lastResult = results[results.length - 1];
-        const hasError = results.some(
+      const lastResult = results[results.length - 1];
+      const hasError = results.some(
+        (r) => r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted",
+      );
+
+      if (hasError) {
+        const errResult = results.find(
           (r) => r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted",
-        );
-
-        if (hasError) {
-          const errResult = results.find(
-            (r) => r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted",
-          )!;
-          const errorMsg =
-            errResult.errorMessage || errResult.stderr || getFinalOutput(errResult.messages) || "(no output)";
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Chain stopped at step ${errResult.step} (${errResult.agent}): ${errorMsg}`,
-              },
-            ],
-            details: makeDetails("chain")(results),
-            isError: true,
-          };
-        }
-
+        )!;
+        const errorMsg =
+          errResult.errorMessage || errResult.stderr || getFinalOutput(errResult.messages) || "(no output)";
         return {
           content: [
             {
               type: "text",
-              text: getFinalOutput(lastResult.messages) || "(no output)",
+              text: `Chain stopped at step ${errResult.step} (${errResult.agent}): ${errorMsg}`,
             },
           ],
           details: makeDetails("chain")(results),
+          isError: true,
         };
       }
 
-      const available = formatAgentList(agents, 5);
       return {
         content: [
           {
             type: "text",
-            text: `Invalid parameters. Available agents: ${available.text}`,
+            text: getFinalOutput(lastResult.messages) || "(no output)",
           },
         ],
-        details: makeDetails("single")([]),
+        details: makeDetails("chain")(results),
       };
     },
 
     renderCall(args, theme, _context) {
-      const scope: AgentScope = args.agentScope ?? "both";
       if (args.chain && args.chain.length > 0) {
         let text =
           theme.fg("toolTitle", theme.bold("subagent ")) +
-          theme.fg("accent", `chain (${args.chain.length} steps)`) +
-          theme.fg("muted", ` [${scope}]`);
+          theme.fg("accent", `chain (${args.chain.length} steps)`);
         for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
           const step = args.chain[i];
-          const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+          const cleanTask = (step.task ?? "").replace(/\{previous\}/g, "").trim();
           const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
           text +=
             "\n  " +
             theme.fg("muted", `${i + 1}.`) +
             " " +
-            theme.fg("accent", step.agent) +
+            theme.fg("accent", step.name || "(unnamed)") +
             theme.fg("dim", ` ${preview}`);
         }
         if (args.chain.length > 3)
@@ -850,26 +1019,22 @@ export default function (pi: ExtensionAPI) {
       if (args.tasks && args.tasks.length > 0) {
         let text =
           theme.fg("toolTitle", theme.bold("subagent ")) +
-          theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-          theme.fg("muted", ` [${scope}]`);
+          theme.fg("accent", `parallel (${args.tasks.length} tasks)`);
         for (const t of args.tasks.slice(0, 3)) {
-          const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-          text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
+          const preview = (t.task ?? "").length > 40 ? `${t.task.slice(0, 40)}...` : t.task ?? "";
+          text += `\n  ${theme.fg("accent", t.name || "(unnamed)")}${theme.fg("dim", ` ${preview}`)}`;
         }
         if (args.tasks.length > 3)
           text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
         return new Text(text, 0, 0);
       }
-      const agentName = args.agent || "...";
+      const name = args.name || "...";
       const preview = args.task
         ? args.task.length > 60
           ? `${args.task.slice(0, 60)}...`
           : args.task
         : "...";
-      let text =
-        theme.fg("toolTitle", theme.bold("subagent ")) +
-        theme.fg("accent", agentName) +
-        theme.fg("muted", ` [${scope}]`);
+      let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", name);
       text += `\n  ${theme.fg("dim", preview)}`;
       return new Text(text, 0, 0);
     },
@@ -888,7 +1053,7 @@ export default function (pi: ExtensionAPI) {
         const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
         const finalOutput = getFinalOutput(r.messages);
 
-        let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+        let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
         if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 
         if (expanded) {
