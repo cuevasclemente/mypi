@@ -10,6 +10,7 @@ secure_data/
 *.swo
 .vscode/
 .idea/
+.codex/
 
 # Per-session pi state. Project config under .pi/ (agents, extensions, teams,
 # wrapper scripts) IS tracked — only sessions/auth files are excluded.

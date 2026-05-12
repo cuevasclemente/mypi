@@ -1,0 +1,6 @@
+[Unit]
+Description=Run mypi dreamer cycle
+
+[Service]
+Type=oneshot
+ExecStart=%h/.pi/agent/dreamer-cron.sh

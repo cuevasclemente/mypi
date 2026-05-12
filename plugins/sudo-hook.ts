@@ -104,8 +104,9 @@ export default function (pi: ExtensionAPI) {
     command: string,
     ctx: ExtensionContext,
   ): Promise<{ command: string; blocked: boolean; reason?: string }> {
-    // Quick check — only proceed if the command uses sudo
-    if (!/\bsudo\b/.test(command)) {
+    // Quick check — only proceed if the shell command invokes sudo as a command
+    // token. Do not trigger on filenames like "sudo-hook.ts".
+    if (!/(^|[\s;&|()])sudo(?=\s|$)/.test(command)) {
       return { command, blocked: false };
     }
 

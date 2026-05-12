@@ -1,110 +1,133 @@
 # mypi
 
-Pi extensions, skills, and hooks development workspace.
+A personal workspace of extensions, skills, and hooks for [**pi**](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) — a hackable CLI coding agent.
 
-## Development Workflow
+If you use pi and want ideas (or working code) for new providers, subagent orchestration, persistent TODOs, or lifecycle hooks, poke around. Everything here is MIT-licensed; copy what's useful.
 
-**Always develop in this repo, then install to the global area — never the other way around.**
+## What's in the box
 
-- Extensions, skills, hooks, agents, and teams live in this repo first
-- Work on them here, test with `pi --extension ./plugins/foo.ts` (or `--skill ./skills/foo/`)
-- When ready, copy/install to `~/.pi/agent/` for global use
-- This keeps a versioned, portable source of truth that can be shared or restored
+### Providers — plug new model backends into pi
 
-## Structure
+| Plugin          | What it does |
+|-----------------|--------------|
+| `claude-code`   | Wraps `claude -p` so your Claude Code subscription is callable as pi models `claude-code/{haiku,sonnet,opus}`. No API key needed — cost flows through your subscription. |
+| `narwhal-horn`  | Registers a local llama.cpp server as a pi provider. Hostname-aware: loopback when run on the host; set `NARWHAL_HORN_BASE_URL` elsewhere. Useful as a template for adding any OpenAI-compatible local server. |
+| `key-switcher`  | Hot-swap OpenRouter API keys (default ↔ zero-data-retention) via a `/or-key` slash command. |
 
-```
-~/src/mypi/
-├── .pi/
-│   ├── extensions/        # Project-local extensions (auto-loaded by pi).
-│   │                       #   These are specific to this workspace and
-│   │                       #   versioned here. Global tools go in
-│   │                       #   ~/.pi/agent/extensions/ instead.
-│   └── exa-mcp-wrapper.sh # MCP wrapper (reads keys from files)
-├── plugins/               # Dev copies of extensions for working on
-│   ├── agent-monitor.ts   #   Monitors agent output for milestone detection
-│   ├── agent-teams/       #   Subagent orchestration & goals system
-│   ├── hooks.ts           #   Lifecycle hook infrastructure
-│   └── todo/              #   Persistent TODO management
-└── skills/                # Skills for this project (developed here)
-    └── mcp/               #   MCP server creation & installation
-```
+### Agent orchestration
 
-## How it works
+| Plugin          | What it does |
+|-----------------|--------------|
+| `agent-teams`   | Long-lived, stateful subagents. The main pi agent designs each subagent's identity (name + system prompt) at spawn time, then messages and polls it as work progresses. Also supports one-shot dispatch (single / parallel / chain) and a goal-tracking system. See [`plugins/agent-teams/README.md`](plugins/agent-teams/README.md). |
+| `agent-monitor` | A cheap, fast watcher model that reviews each agent turn and flags meaningful milestones — useful for prompting journaling, memory updates, or other end-of-turn rituals. |
+| `dreamer`       | Scheduled systemd user timer that reflects on recent sessions and proposes new skills to extract. |
 
-- **Runtime:** Pi loads extensions from `~/.pi/agent/extensions/`, skills from `~/.pi/agent/skills/`
-- **Development:** Work on extensions in `plugins/`, skills in `skills/`, then deploy to `~/.pi/agent/` when ready
-- **Deployment:** Use the Makefile to copy or symlink repo plugins into the pi extension discovery directories
-- **Testing locally:** Use `--extension` / `--skill` flags to load directly from this repo without installing globally
+### Workflow utilities
+
+| Plugin           | What it does |
+|------------------|--------------|
+| `todo`           | Persistent TODO management — survives across pi sessions. |
+| `hooks`          | Lifecycle-hook infrastructure. Define reminders in `hooks.json` that fire at specific events (session start/end, tool use, etc.). See `hooks.json.example`. |
+| `interview` / `questionnaire` | Ask the user one or more structured questions and get back typed answers. Single-question and tab-bar multi-question modes. |
+| `sudo-hook`      | Example hook extension that feeds a sudo password to pi when prompted. |
+
+### Skills
+
+Skills are markdown documents pi can pull into its context on demand.
+
+| Skill          | What it covers |
+|----------------|----------------|
+| `mcp`          | Creating, installing, and configuring MCP servers with the `pi-mcp-adapter`. |
+| `pi-monitors`  | Patterns for writing monitor-style extensions. |
+| `memoriki`     | Personal memory system (specific to my setup — included as an example of a skill that wires together MCP tools and a static wiki). |
+
+## Quick start
 
 ```bash
-# Test an extension without installing globally
-pi --extension ./plugins/my-ext.ts "test it"
+git clone git@github.com:cuevasclemente/mypi.git
+cd mypi
+npm install
 
-# Test a skill
+# See what's available
+make list-plugins
+make list-skills
+
+# Try a plugin without installing it globally
+pi --extension ./plugins/todo "what's on my list?"
+
+# Install plugins to ~/.pi/agent/extensions (copies by default)
+make install
+
+# Install plugins, skills, hooks config, global AGENTS.md, and dreamer timer
+make install-all
+
+# Or symlink plugins, so edits in this repo are live
+make install MODE=symlink
+
+# Install a subset
+make user-install PLUGINS="todo agent-teams"
+
+# Install into another project's local .pi/extensions
+make project-install PROJECT_DIR=/path/to/other-repo PLUGINS="todo"
+```
+
+## Layout
+
+```
+mypi/
+├── plugins/              # Source of truth for extensions (developed here)
+│   ├── agent-teams/      #   Subagent orchestration + goals
+│   ├── claude-code/      #   Claude Code subscription as a pi provider
+│   ├── narwhal-horn/     #   Local llama.cpp as a pi provider
+│   ├── key-switcher/     #   OpenRouter key hot-swap
+│   ├── todo/             #   Persistent TODOs
+│   ├── agent-monitor.ts  #   End-of-turn milestone detector
+│   ├── hooks.ts          #   Lifecycle hook runner
+│   ├── dreamer.ts        #   Session reflection → new skills
+│   └── ...
+├── skills/               # Skills (markdown docs pi can load)
+├── .pi/extensions/       # Project-local pi extensions (auto-loaded)
+├── secure_data/          # git-ignored; holds API keys for plugins that need them
+├── Makefile              # Deployment to ~/.pi/agent/ or another project
+└── hooks.json.example    # Template for the hooks extension
+```
+
+### Two deployment targets
+
+- **Global** (`~/.pi/agent/extensions/`) — tools you want available everywhere.
+- **Project-local** (`<project>/.pi/extensions/`) — tools scoped to one workspace, versioned alongside that project's code.
+
+`make` handles both. `MODE=symlink` is handy during development so edits here are immediately reflected.
+
+## Working on a plugin
+
+Develop in this repo, then install — never edit installed copies directly.
+
+```bash
+# Iterate fast: load straight from the repo, no install step
+pi --extension ./plugins/my-ext.ts "test it"
 pi --skill ./skills/mcp/ "use the mcp skill"
 ```
 
-## Extension placement
-
-- **Project-local** (`.pi/extensions/`): Tools specific to this project/workspace. Versioned in this repo, auto-discovered by pi.
-- **Global** (`~/.pi/agent/extensions/`): Tools needed across all projects. Symlinked or copied from `plugins/` when ready.
-
-## Deploying extensions
-
-List deployable plugins:
-
-```bash
-make list-plugins
-```
-
-Install all plugins globally for the current user:
-
-```bash
-make install
-```
-
-Install selected plugins globally:
-
-```bash
-make user-install PLUGINS="todo agent-teams"
-```
-
-Install selected plugins into another project's local pi extension directory:
-
-```bash
-make project-install PROJECT_DIR=/path/to/project PLUGINS="todo agent-teams"
-# alias:
-make make-project-install PROJECT_DIR=/path/to/project PLUGINS="todo agent-teams"
-```
-
-By default deployment copies files. Use `MODE=symlink` if you want installed extensions to track this checkout directly:
-
-```bash
-make install MODE=symlink
-```
+When it's working, `make install` (or symlink it) and it's live globally.
 
 ## Secrets
 
-`secure_data/` is git-ignored. After cloning, populate the files the active plugins need (all mode `0600`):
+Some plugins need API keys. `secure_data/` is git-ignored; create the files with `0600` permissions:
 
-| File                              | Used by                  |
-|-----------------------------------|--------------------------|
-| `secure_data/openrouter_key`      | `plugins/key-switcher`   |
-| `secure_data/zdr_openrouter_key`  | `plugins/key-switcher`   |
-| `secure_data/narwhal_horn_key`    | `plugins/narwhal-horn`   |
+| File                              | Used by                |
+|-----------------------------------|------------------------|
+| `secure_data/exa_key`             | Exa MCP wrapper        |
+| `secure_data/openrouter_key`      | `key-switcher`         |
+| `secure_data/zdr_openrouter_key`  | `key-switcher`         |
+| `secure_data/narwhal_horn_key`    | `narwhal-horn`         |
 
-The `narwhal_horn_key` value must match `LLAMA_API_KEY` in `/etc/llama-server/env` on the host running the llama.cpp server.
+For `narwhal-horn`, the key must match the llama.cpp server's API key.
 
-## Plugins
+## Status
 
-| Plugin            | What it does                                                                 |
-|-------------------|------------------------------------------------------------------------------|
-| `narwhal-horn`    | Registers the local Qwen3.6-Heretic llama.cpp server as a pi provider. Hostname-aware (`127.0.0.1` on narwhal-horn; set `NARWHAL_HORN_BASE_URL` elsewhere). |
-| `claude-code`     | Wraps `claude -p --output-format json` so the user's Claude Code subscription is callable as pi models `claude-code/{haiku,sonnet,opus}`. No API key needed. |
-| `key-switcher`    | Swap OpenRouter API keys (default ↔ ZDR) via `/or-key` slash command.        |
-| `agent-teams`     | Subagent orchestration + goals.                                              |
-| `agent-monitor`   | Detect milestones in agent output.                                           |
-| `dreamer`         | Reflect on session history; suggest new skills.                              |
-| `hooks`           | Lifecycle hook infrastructure.                                               |
-| `todo`            | Persistent TODO management.                                                  |
+This is a personal workspace, not a curated product — interfaces may shift as pi evolves. That said, the pieces here have been working reliably day-to-day, and most are small enough to fork and trim to taste. PRs and issues welcome; suggestions and ideas even more so.
+
+## License
+
+[MIT](LICENSE).

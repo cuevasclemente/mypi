@@ -1,0 +1,10 @@
+[Unit]
+Description=Run mypi dreamer cycle daily
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+Unit=mypi-dreamer.service
+
+[Install]
+WantedBy=timers.target
