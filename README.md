@@ -2,7 +2,7 @@
 
 A personal workspace of extensions, skills, and hooks for [**pi**](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) — a hackable CLI coding agent.
 
-If you use pi and want ideas (or working code) for new providers, subagent orchestration, persistent TODOs, or lifecycle hooks, poke around. Everything here is MIT-licensed; copy what's useful.
+If you use pi and want ideas (or working code) for new providers, subagent orchestration, persistent TODOs, or lifecycle hooks, poke around. Everything here is Mozilla-licensed; copy what's useful and change it to your heart's content, and you can use it in commercial applications, but if you're basing pi plugins off of mine please make sure to also open-source them to abide by the license terms (eg: my plugins cannot become the basis of future closed-source pi plugins). 
 
 ## What's in the box
 
