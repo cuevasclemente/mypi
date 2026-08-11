@@ -17,11 +17,9 @@
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   Container,
-  type Keybindings,
   matchesKey,
   Spacer,
   Text,
@@ -47,6 +45,8 @@ interface Todo {
   assignee?: string;
   /** Optional notes/context */
   notes?: string;
+  /** Explicit display order, present only after a reorder */
+  rank?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -122,118 +122,238 @@ function isTodoPriority(value: unknown): value is TodoPriority {
   return typeof value === "string" && value in PRIORITY_ORDER;
 }
 
-function stringOrUndefined(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+export const TODO_LIMITS = Object.freeze({
+  maxTodos: 128,
+  maxTextBytes: 4096,
+  maxNotesBytes: 8192,
+  maxAssigneeBytes: 512,
+  maxDependencies: 64,
+  maxBatchItems: 128,
+  maxStateBytes: 40 * 1024,
+  maxToolOutputBytes: 47 * 1024,
+});
+
+interface TodoSnapshot {
+  todos: Todo[];
+  nextId: number;
 }
 
-function numberArrayOrEmpty(value: unknown): number[] {
-  return Array.isArray(value) ? value.filter((v): v is number => typeof v === "number") : [];
+interface RestoredTodoSnapshot extends TodoSnapshot {
+  entryIndex: number;
+}
+
+const utf8 = new TextEncoder();
+
+function byteLength(value: string): number {
+  return utf8.encode(value).byteLength;
+}
+
+function boundedString(
+  value: unknown,
+  field: string,
+  maxBytes: number,
+  options: { optional?: boolean; allowEmpty?: boolean } = {},
+): string | undefined {
+  if (value === undefined && options.optional) return undefined;
+  if (typeof value !== "string") throw new Error(`todo: '${field}' must be a string`);
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    if (options.allowEmpty) return "";
+    throw new Error(`todo: '${field}' must not be empty`);
+  }
+  if (byteLength(value) > maxBytes) {
+    throw new Error(`todo: '${field}' exceeds ${maxBytes} UTF-8 bytes`);
+  }
+  return value;
+}
+
+function optionalStoredString(value: unknown, field: string, maxBytes: number): string | undefined {
+  // Older snapshots could serialize cleared optionals as null or empty strings.
+  // Normalize all absent forms to an omitted property in canonical snapshots.
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string" && value.trim().length === 0) return undefined;
+  return boundedString(value, field, maxBytes);
+}
+
+function positiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`todo: '${field}' must be a positive safe integer`);
+  }
+  return value;
+}
+
+function validateDependencies(value: unknown, field = "dependencies"): number[] {
+  if (!Array.isArray(value)) throw new Error(`todo: '${field}' must be an array`);
+  if (value.length > TODO_LIMITS.maxDependencies) {
+    throw new Error(`todo: '${field}' exceeds ${TODO_LIMITS.maxDependencies} items`);
+  }
+
+  const dependencies = value.map((id, index) => positiveInteger(id, `${field}[${index}]`));
+  if (new Set(dependencies).size !== dependencies.length) {
+    throw new Error(`todo: '${field}' must not contain duplicate IDs`);
+  }
+  return dependencies;
+}
+
+function cloneTodo(todo: Todo): Todo {
+  return { ...todo, dependencies: [...todo.dependencies] };
+}
+
+function cloneSnapshot(snapshot: TodoSnapshot): TodoSnapshot {
+  return { todos: snapshot.todos.map(cloneTodo), nextId: snapshot.nextId };
+}
+
+function validateTodo(value: unknown, index: number): Todo {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`todo: snapshot todo[${index}] must be an object`);
+  }
+
+  const raw = value as Record<string, unknown>;
+  const id = positiveInteger(raw.id, `todos[${index}].id`);
+  const text = boundedString(raw.text, `todos[${index}].text`, TODO_LIMITS.maxTextBytes)!;
+  const status = raw.status;
+  const priority = raw.priority;
+  if (!isTodoStatus(status)) throw new Error(`todo: invalid status in todo #${id}`);
+  if (!isTodoPriority(priority)) throw new Error(`todo: invalid priority in todo #${id}`);
+  const dependencies = validateDependencies(raw.dependencies, `todos[${index}].dependencies`);
+  const assignee = optionalStoredString(raw.assignee, `todos[${index}].assignee`, TODO_LIMITS.maxAssigneeBytes);
+  const notes = optionalStoredString(raw.notes, `todos[${index}].notes`, TODO_LIMITS.maxNotesBytes);
+  let rank: number | undefined;
+  if (raw.rank !== undefined && raw.rank !== null) {
+    if (
+      typeof raw.rank !== "number" ||
+      !Number.isSafeInteger(raw.rank) ||
+      raw.rank < 0 ||
+      raw.rank >= TODO_LIMITS.maxTodos
+    ) {
+      throw new Error(`todo: invalid rank in todo #${id}`);
+    }
+    rank = raw.rank;
+  }
+  if (typeof raw.createdAt !== "number" || !Number.isSafeInteger(raw.createdAt) || raw.createdAt < 0) {
+    throw new Error(`todo: invalid createdAt in todo #${id}`);
+  }
+  if (typeof raw.updatedAt !== "number" || !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt < 0) {
+    throw new Error(`todo: invalid updatedAt in todo #${id}`);
+  }
+
+  const todo: Todo = {
+    id,
+    text,
+    status,
+    priority,
+    dependencies,
+    createdAt: raw.createdAt as number,
+    updatedAt: raw.updatedAt as number,
+  };
+  if (assignee !== undefined) todo.assignee = assignee;
+  if (notes !== undefined) todo.notes = notes;
+  if (rank !== undefined) todo.rank = rank;
+  return todo;
+}
+
+function validateSnapshot(value: unknown): TodoSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("todo: snapshot must be an object");
+  }
+
+  const raw = value as Record<string, unknown>;
+  if (!Array.isArray(raw.todos)) throw new Error("todo: snapshot todos must be an array");
+  if (raw.todos.length > TODO_LIMITS.maxTodos) {
+    throw new Error(`todo: snapshot exceeds ${TODO_LIMITS.maxTodos} todos`);
+  }
+
+  const todos = raw.todos.map(validateTodo);
+  const ids = todos.map((todo) => todo.id);
+  if (new Set(ids).size !== ids.length) throw new Error("todo: snapshot contains duplicate todo IDs");
+  const ranks = todos.flatMap((todo) => (todo.rank === undefined ? [] : [todo.rank]));
+  if (new Set(ranks).size !== ranks.length) throw new Error("todo: snapshot contains duplicate todo ranks");
+
+  const maxId = ids.length > 0 ? Math.max(...ids) : 0;
+  const derivedNextId = maxId + 1;
+  const nextId =
+    raw.nextId === undefined || raw.nextId === null
+      ? positiveInteger(derivedNextId, "nextId")
+      : positiveInteger(raw.nextId, "nextId");
+  if (nextId <= maxId) throw new Error("todo: snapshot nextId must be greater than every todo ID");
+
+  const snapshot = { todos, nextId };
+  if (byteLength(JSON.stringify(snapshot)) > TODO_LIMITS.maxStateBytes) {
+    throw new Error(`todo: snapshot exceeds ${TODO_LIMITS.maxStateBytes} UTF-8 bytes`);
+  }
+  return cloneSnapshot(snapshot);
+}
+
+function snapshotFromEntry(entry: any): TodoSnapshot | undefined {
+  if (entry?.type === "message") {
+    const message = entry.message;
+    if (message?.role !== "toolResult" || message.toolName !== "todo") return undefined;
+    return validateSnapshot(message.details);
+  }
+  if (entry?.type === "custom" && entry.customType === "todo-state") {
+    return validateSnapshot(entry.data);
+  }
+  return undefined;
+}
+
+function newestBranchSnapshot(branch: readonly any[]): RestoredTodoSnapshot | undefined {
+  for (let index = branch.length - 1; index >= 0; index--) {
+    try {
+      const snapshot = snapshotFromEntry(branch[index]);
+      if (snapshot) return { ...snapshot, entryIndex: index };
+    } catch {
+      // Session data is untrusted. Ignore malformed/oversized snapshots and
+      // continue toward the newest earlier snapshot that is fully valid.
+    }
+  }
+  return undefined;
+}
+
+function capToolText(text: string): string {
+  if (byteLength(text) < TODO_LIMITS.maxToolOutputBytes) return text;
+
+  const suffix = "\n\n[TODO output truncated]";
+  const budget = TODO_LIMITS.maxToolOutputBytes - byteLength(suffix) - 1;
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (byteLength(text.slice(0, mid)) <= budget) low = mid;
+    else high = mid - 1;
+  }
+  let prefix = text.slice(0, low);
+  const finalCodeUnit = prefix.charCodeAt(prefix.length - 1);
+  if (finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) prefix = prefix.slice(0, -1);
+  return prefix + suffix;
 }
 
 // ── Sorting ─────────────────────────────────────────────────────────────────────
 
+function compareDefaultTodoOrder(a: Todo, b: Todo): number {
+  const statusDiff = (STATUS_ORDER[a.status] ?? 99) - (STATUS_ORDER[b.status] ?? 99);
+  if (statusDiff !== 0) return statusDiff;
+  const priorityDiff = (PRIORITY_ORDER[a.priority] ?? 99) - (PRIORITY_ORDER[b.priority] ?? 99);
+  if (priorityDiff !== 0) return priorityDiff;
+  return a.id - b.id;
+}
+
 function sortTodos(todos: Todo[]): Todo[] {
+  const hasExplicitOrder = todos.some((todo) => todo.rank !== undefined);
   return [...todos].sort((a, b) => {
-    // Primary: status order
-    const statusDiff = (STATUS_ORDER[a.status] ?? 99) - (STATUS_ORDER[b.status] ?? 99);
-    if (statusDiff !== 0) return statusDiff;
-    // Secondary: priority order
-    const prioDiff = (PRIORITY_ORDER[a.priority] ?? 99) - (PRIORITY_ORDER[b.priority] ?? 99);
-    if (prioDiff !== 0) return prioDiff;
-    // Tertiary: creation order
-    return a.id - b.id;
-  });
-}
-
-// ── Session State ───────────────────────────────────────────────────────────────
-
-let todos: Todo[] = [];
-let nextId = 1;
-
-function resetState(): void {
-  todos = [];
-  nextId = 1;
-}
-
-function reconstructState(ctx: ExtensionContext): void {
-  resetState();
-
-  for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type !== "message") continue;
-    const msg = entry.message;
-    if (msg.role !== "toolResult" || msg.toolName !== "todo") continue;
-
-    const details = msg.details as TodoDetails | undefined;
-    if (details && details.todos) {
-      // The last tool result that has todos reflects the current state
-      todos = details.todos.map((t) => ({ ...t }));
-      nextId = details.nextId ?? (todos.length > 0 ? Math.max(...todos.map((t) => t.id)) + 1 : 1);
+    if (hasExplicitOrder) {
+      const rankDiff = (a.rank ?? TODO_LIMITS.maxTodos) - (b.rank ?? TODO_LIMITS.maxTodos);
+      if (rankDiff !== 0) return rankDiff;
     }
-  }
-}
-
-function applyChanges(action: string, message?: string): TodoDetails {
-  todos = sortTodos(todos);
-  return { action, todos: todos.map((t) => ({ ...t })), nextId, message };
-}
-
-function finishTodoAction(action: string, message: string | undefined, ctx?: ExtensionContext): TodoDetails {
-  const details = applyChanges(action, message);
-  if (ctx) updateWidget(ctx);
-  return details;
-}
-
-function persistTodoState(pi: ExtensionAPI): void {
-  pi.appendEntry("todo-state", {
-    todos: todos.map((t) => ({ ...t })),
-    nextId,
+    // Rankless snapshots preserve the long-standing status/priority/id sort.
+    // Unranked tasks added after an explicit reorder use that same fallback.
+    return compareDefaultTodoOrder(a, b);
   });
-}
-
-function applyPreseedEntries(ctx: ExtensionContext): number {
-  let added = 0;
-
-  for (const entry of ctx.sessionManager.getEntries()) {
-    if (entry.type !== "custom" || entry.customType !== "todo-preseed") continue;
-    const data = entry.data as TodoPreseedDetails | undefined;
-    if (!data || !Array.isArray(data.todos)) continue;
-
-    const source = stringOrUndefined(data.hook) ?? "hook";
-
-    for (const raw of data.todos as TodoPreseedItem[]) {
-      const text = stringOrUndefined(raw?.text);
-      if (!text) continue;
-
-      // Preseed TODOs are session rituals. If the user already completed,
-      // cancelled, or edited the same checklist item in this session, do not
-      // recreate it on reload/resume.
-      if (todos.some((todo) => todo.text === text)) continue;
-
-      const now = Date.now() + added;
-      const todo: Todo = {
-        id: nextId++,
-        text,
-        status: isTodoStatus(raw.status) ? raw.status : "pending",
-        priority: isTodoPriority(raw.priority) ? raw.priority : "medium",
-        dependencies: numberArrayOrEmpty(raw.dependencies),
-        assignee: stringOrUndefined(raw.assignee) ?? source,
-        notes: stringOrUndefined(raw.notes),
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      todos.push(todo);
-      added++;
-    }
-  }
-
-  if (added > 0) todos = sortTodos(todos);
-  return added;
 }
 
 // ── Widget ──────────────────────────────────────────────────────────────────────
 
-function renderWidgetLine(todo: Todo, theme: Theme, width: number): string {
+function renderWidgetLine(todo: Todo, allTodos: readonly Todo[], theme: Theme, width: number): string {
   const statusIcon = STATUS_LABELS[todo.status];
   const statusColor = STATUS_COLORS[todo.status];
   const prioIcon = todo.priority === "critical" ? "!!" : todo.priority === "high" ? "!" : "";
@@ -260,7 +380,7 @@ function renderWidgetLine(todo: Todo, theme: Theme, width: number): string {
   if (todo.status === "blocked" && todo.dependencies.length > 0) {
     const deps = todo.dependencies
       .map((did) => {
-        const dep = todos.find((t) => t.id === did);
+        const dep = allTodos.find((t) => t.id === did);
         return dep ? `#${did}(${dep.status})` : `#${did}`;
       })
       .join(", ");
@@ -270,7 +390,7 @@ function renderWidgetLine(todo: Todo, theme: Theme, width: number): string {
   return truncateToWidth(line, width);
 }
 
-function updateWidget(ctx: ExtensionContext): void {
+function updateWidget(ctx: ExtensionContext, todos: readonly Todo[]): void {
   if (!ctx.hasUI) return;
 
   const active = todos.filter((t) => t.status !== "cancelled");
@@ -310,7 +430,7 @@ function updateWidget(ctx: ExtensionContext): void {
         );
 
         for (const todo of visible) {
-          lines.push(renderWidgetLine(todo, theme, width));
+          lines.push(renderWidgetLine(todo, todos, theme, width));
         }
 
         if (more > 0) {
@@ -332,10 +452,12 @@ class TodoListComponent {
   private selectList: SelectList;
   private onClose: () => void;
   private theme: Theme;
+  private summaryTodos: Todo[];
 
   constructor(todoDisplay: { todo: Todo; label: string }[], theme: Theme, onClose: () => void) {
     this.theme = theme;
     this.onClose = onClose;
+    this.summaryTodos = todoDisplay.map(({ todo }) => cloneTodo(todo));
 
     this.items = todoDisplay.map((t) => ({
       value: String(t.todo.id),
@@ -368,7 +490,7 @@ class TodoListComponent {
     const lines: string[] = [];
 
     // Header
-    const active = todos.filter((t) => t.status !== "cancelled");
+    const active = this.summaryTodos.filter((t) => t.status !== "cancelled");
     const done = active.filter((t) => t.status === "done");
     const pending = active.filter((t) => t.status !== "done");
     const header =
@@ -411,13 +533,17 @@ type ManagerAction = "toggle" | "edit" | "delete" | "assign" | "reorder" | "exit
 class TodoManagerComponent {
   private onClose: () => void;
   private theme: Theme;
+  private getTodos: () => Todo[];
+  private onMutate: () => void;
   private selectedIndex = 0;
   private actionMode: ManagerAction | null = null;
   private cachedWidth?: number;
   private cachedLines?: string[];
 
-  constructor(theme: Theme, onClose: () => void) {
+  constructor(theme: Theme, getTodos: () => Todo[], onMutate: () => void, onClose: () => void) {
     this.theme = theme;
+    this.getTodos = getTodos;
+    this.onMutate = onMutate;
     this.onClose = onClose;
   }
 
@@ -430,6 +556,7 @@ class TodoManagerComponent {
       return;
     }
 
+    const todos = this.getTodos();
     const list = sortTodos(todos.filter((t) => t.status !== "cancelled"));
 
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
@@ -450,6 +577,7 @@ class TodoManagerComponent {
           todo.status = "done";
         }
         todo.updatedAt = Date.now();
+        this.onMutate();
         this.invalidate();
       }
     } else if (data === "d") {
@@ -457,7 +585,10 @@ class TodoManagerComponent {
       if (list[this.selectedIndex]) {
         const t = list[this.selectedIndex];
         const idx = todos.findIndex((x) => x.id === t.id);
-        if (idx >= 0) todos.splice(idx, 1);
+        if (idx >= 0) {
+          todos.splice(idx, 1);
+          this.onMutate();
+        }
         this.selectedIndex = Math.min(this.selectedIndex, todos.length - 1);
         this.actionMode = null;
         this.invalidate();
@@ -468,6 +599,7 @@ class TodoManagerComponent {
         const todo = list[this.selectedIndex];
         todo.status = todo.status === "blocked" ? "pending" : "blocked";
         todo.updatedAt = Date.now();
+        this.onMutate();
         this.invalidate();
       }
     } else if (data === "i") {
@@ -476,6 +608,7 @@ class TodoManagerComponent {
         const todo = list[this.selectedIndex];
         todo.status = todo.status === "in_progress" ? "pending" : "in_progress";
         todo.updatedAt = Date.now();
+        this.onMutate();
         this.invalidate();
       }
     }
@@ -488,6 +621,7 @@ class TodoManagerComponent {
 
     const th = this.theme;
     const lines: string[] = [];
+    const todos = this.getTodos();
     const list = sortTodos(todos.filter((t) => t.status !== "cancelled"));
 
     // Header
@@ -603,8 +737,8 @@ function todoToMarkdown(todos: Todo[]): string {
   return lines.join("\n");
 }
 
-function formatTodosForPrompt(exported?: Todo[]): string {
-  const list = sortTodos(exported ?? todos);
+function formatTodosForPrompt(exported: readonly Todo[]): string {
+  const list = sortTodos([...exported]);
   if (list.length === 0) return "(no active todos)";
 
   const categories: Record<string, Todo[]> = {
@@ -658,127 +792,203 @@ const TodoStatusEnum = StringEnum(["pending", "in_progress", "done", "blocked", 
   description: "Task status",
 });
 
-const AddItem = Type.Object({
-  text: Type.String({ description: "Todo text" }),
-  priority: Type.Optional(TodoPriorityEnum),
-  status: Type.Optional(TodoStatusEnum),
-  assignee: Type.Optional(Type.String({ description: "Subagent or role assigned to this task" })),
-  dependencies: Type.Optional(
-    Type.Array(Type.Number(), { description: "IDs of tasks this depends on" }),
-  ),
-  notes: Type.Optional(Type.String({ description: "Additional notes/context" })),
-});
+const TodoText = Type.String({ minLength: 1, maxLength: TODO_LIMITS.maxTextBytes });
+const TodoNotes = Type.String({ maxLength: TODO_LIMITS.maxNotesBytes });
+const TodoAssignee = Type.String({ maxLength: TODO_LIMITS.maxAssigneeBytes });
+const TodoId = Type.Integer({ minimum: 1 });
+const TodoDependencies = Type.Array(TodoId, { maxItems: TODO_LIMITS.maxDependencies });
 
-const UpdateItem = Type.Object({
-  id: Type.Number({ description: "ID of the todo to update" }),
-  text: Type.Optional(Type.String({ description: "Updated todo text" })),
-  status: Type.Optional(TodoStatusEnum),
-  priority: Type.Optional(TodoPriorityEnum),
-  assignee: Type.Optional(Type.String({ description: "Subagent or role assigned" })),
-  dependencies: Type.Optional(
-    Type.Array(Type.Number(), { description: "IDs of tasks this depends on" }),
-  ),
-  notes: Type.Optional(Type.String({ description: "Additional notes" })),
-});
+const BatchItem = Type.Object(
+  {
+    action: StringEnum(["add", "update", "toggle", "delete"] as const),
+    /** For add/update */
+    text: Type.Optional(TodoText),
+    priority: Type.Optional(TodoPriorityEnum),
+    assignee: Type.Optional(TodoAssignee),
+    /** For update/toggle/delete */
+    id: Type.Optional(TodoId),
+    status: Type.Optional(TodoStatusEnum),
+  },
+  { additionalProperties: false },
+);
 
-const BatchItem = Type.Object({
-  action: StringEnum(["add", "update", "toggle", "delete"] as const),
-  /** For add */
-  text: Type.Optional(Type.String()),
-  priority: Type.Optional(TodoPriorityEnum),
-  assignee: Type.Optional(Type.String()),
-  /** For update/toggle/delete */
-  id: Type.Optional(Type.Number()),
-  status: Type.Optional(TodoStatusEnum),
-});
-
-const TodoParams = Type.Object({
-  action: TodoAction,
-  /** For list: filter by status */
-  status: Type.Optional(TodoStatusEnum),
-  assignee: Type.Optional(Type.String({ description: "For add/update: subagent or role" })),
-  /** For add */
-  text: Type.Optional(Type.String({ description: "Todo text" })),
-  priority: Type.Optional(TodoPriorityEnum),
-  notes: Type.Optional(Type.String({ description: "Additional notes" })),
-  dependencies: Type.Optional(
-    Type.Array(Type.Number(), { description: "IDs of tasks this depends on" }),
-  ),
-  /** For update/toggle/reorder */
-  id: Type.Optional(Type.Number({ description: "ID of the todo" })),
-  newStatus: Type.Optional(TodoStatusEnum),
-  newPriority: Type.Optional(TodoPriorityEnum),
-  newAssignee: Type.Optional(Type.String()),
-  newText: Type.Optional(Type.String()),
-  newNotes: Type.Optional(Type.String()),
-  newDependencies: Type.Optional(Type.Array(Type.Number())),
-  /** For reorder: ordered list of IDs */
-  order: Type.Optional(Type.Array(Type.Number(), { description: "New ordering as list of IDs" })),
-  /** For batch operations */
-  items: Type.Optional(
-    Type.Array(BatchItem, { description: "Batch of operations to apply in order" }),
-  ),
-});
+const TodoParams = Type.Object(
+  {
+    action: TodoAction,
+    /** For list/add/update: status */
+    status: Type.Optional(TodoStatusEnum),
+    assignee: Type.Optional(TodoAssignee),
+    /** For add */
+    text: Type.Optional(TodoText),
+    priority: Type.Optional(TodoPriorityEnum),
+    notes: Type.Optional(TodoNotes),
+    dependencies: Type.Optional(TodoDependencies),
+    /** For update/toggle/reorder */
+    id: Type.Optional(TodoId),
+    newStatus: Type.Optional(TodoStatusEnum),
+    newPriority: Type.Optional(TodoPriorityEnum),
+    newAssignee: Type.Optional(TodoAssignee),
+    newText: Type.Optional(TodoText),
+    newNotes: Type.Optional(TodoNotes),
+    newDependencies: Type.Optional(TodoDependencies),
+    /** For reorder: ordered list of IDs */
+    order: Type.Optional(
+      Type.Array(TodoId, { maxItems: TODO_LIMITS.maxTodos, description: "New ordering as list of IDs" }),
+    ),
+    /** For batch operations */
+    items: Type.Optional(
+      Type.Array(BatchItem, {
+        minItems: 1,
+        maxItems: TODO_LIMITS.maxBatchItems,
+        description: "Batch of operations to apply in order",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 // ── Extension ───────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // State is deliberately owned by this factory invocation. Wayang can host
+  // multiple Pi sessions in one process, so module-level mutable state would
+  // leak todos between independent extension instances.
+  let todos: Todo[] = [];
+  let nextId = 1;
   let widgetEnabled = true;
+  let restoredEntryIndex = -1;
 
-  // ── State reconstruction ──────────────────────────────────────────────────
+  const commitSnapshot = (snapshot: TodoSnapshot): void => {
+    const copy = cloneSnapshot(snapshot);
+    todos = copy.todos;
+    nextId = copy.nextId;
+  };
 
-  pi.on("session_start", async (_event, ctx) => {
-    // Primary: reconstruct from tool result entries on the branch
-    reconstructState(ctx);
+  const currentSnapshot = (): TodoSnapshot => validateSnapshot({ todos, nextId });
 
-    // Fallback: if nothing found in tool results, try custom entries
-    if (todos.length === 0) {
-      for (const entry of ctx.sessionManager.getEntries()) {
-        if (entry.type === "custom" && entry.customType === "todo-state") {
-          const data = entry.data as { todos?: Todo[]; nextId?: number } | undefined;
-          if (data?.todos) {
-            todos = data.todos.map((t) => ({ ...t }));
-            nextId = data.nextId ?? (todos.length > 0 ? Math.max(...todos.map((t) => t.id)) + 1 : 1);
-          }
+  const reconstructState = (ctx: ExtensionContext): void => {
+    const branch = ctx.sessionManager.getBranch();
+    const restored = newestBranchSnapshot(branch);
+    if (restored) {
+      commitSnapshot(restored);
+      restoredEntryIndex = restored.entryIndex;
+    } else {
+      todos = [];
+      nextId = 1;
+      restoredEntryIndex = -1;
+    }
+  };
+
+  const applyChanges = (action: string, message?: string): TodoDetails => {
+    todos = sortTodos(todos);
+    const snapshot = currentSnapshot();
+    return { action, todos: snapshot.todos, nextId: snapshot.nextId, message };
+  };
+
+  const finishTodoAction = (action: string, message: string | undefined, ctx?: ExtensionContext): TodoDetails => {
+    const details = applyChanges(action, message);
+    if (ctx) updateWidget(ctx, todos);
+    return details;
+  };
+
+  const persistTodoState = (): void => {
+    // Canonical persistence sorts through the same rank-aware path used by
+    // returns and renderers, and never exposes live arrays to appendEntry.
+    const canonical = currentSnapshot();
+    canonical.todos = sortTodos(canonical.todos);
+    commitSnapshot(canonical);
+    pi.appendEntry("todo-state", cloneSnapshot(canonical));
+  };
+
+  const applyPreseedEntries = (ctx: ExtensionContext): number => {
+    const branch = ctx.sessionManager.getBranch();
+    const branchSnapshot = newestBranchSnapshot(branch);
+    const preseedStart = (branchSnapshot?.entryIndex ?? restoredEntryIndex) + 1;
+    let working = cloneSnapshot({ todos, nextId });
+    let added = 0;
+
+    // A snapshot already reflects all earlier preseeds (including deliberate
+    // deletion). Only consume current-branch preseeds appended after it.
+    for (let index = preseedStart; index < branch.length; index++) {
+      const entry = branch[index] as any;
+      if (entry?.type !== "custom" || entry.customType !== "todo-preseed") continue;
+      const data = entry.data as TodoPreseedDetails | undefined;
+      if (!data || !Array.isArray(data.todos)) continue;
+
+      let source: string;
+      try {
+        source = boundedString(data.hook ?? "hook", "preseed hook", TODO_LIMITS.maxAssigneeBytes)!;
+      } catch {
+        continue;
+      }
+
+      for (const raw of data.todos as TodoPreseedItem[]) {
+        try {
+          if (working.todos.length >= TODO_LIMITS.maxTodos) break;
+          const text = boundedString(raw?.text, "preseed text", TODO_LIMITS.maxTextBytes)!;
+          if (working.todos.some((todo) => todo.text === text)) continue;
+
+          const status = raw.status === undefined ? "pending" : raw.status;
+          const priority = raw.priority === undefined ? "medium" : raw.priority;
+          if (!isTodoStatus(status) || !isTodoPriority(priority)) continue;
+          const dependencies = raw.dependencies === undefined ? [] : validateDependencies(raw.dependencies);
+          const assignee =
+            raw.assignee === undefined
+              ? source
+              : boundedString(raw.assignee, "preseed assignee", TODO_LIMITS.maxAssigneeBytes)!;
+          const notes = optionalStoredString(raw.notes, "preseed notes", TODO_LIMITS.maxNotesBytes);
+          const now = Date.now() + added;
+          const candidate = cloneSnapshot(working);
+          candidate.todos.push({
+            id: candidate.nextId++,
+            text,
+            status,
+            priority,
+            dependencies,
+            assignee,
+            notes,
+            createdAt: now,
+            updatedAt: now,
+          });
+          working = validateSnapshot(candidate);
+          added++;
+        } catch {
+          // A malformed or over-budget hook item cannot poison session restore.
         }
       }
     }
 
-    if (applyPreseedEntries(ctx) > 0) {
-      persistTodoState(pi);
+    if (added > 0) {
+      working.todos = sortTodos(working.todos);
+      commitSnapshot(working);
     }
+    return added;
+  };
 
-    updateWidget(ctx);
-  });
-
-  pi.on("session_tree", async (_event, ctx) => {
+  const restoreBranch = (ctx: ExtensionContext): void => {
     reconstructState(ctx);
-    if (applyPreseedEntries(ctx) > 0) {
-      persistTodoState(pi);
-    }
-    updateWidget(ctx);
-  });
+    if (applyPreseedEntries(ctx) > 0) persistTodoState();
+    updateWidget(ctx, todos);
+  };
 
-  // ── Persist state after tool calls ────────────────────────────────────────
+  // Restore both when the extension instance starts and whenever /tree changes
+  // the active leaf within that same instance.
+  pi.on("session_start", async (_event, ctx) => restoreBranch(ctx));
+  pi.on("session_tree", async (_event, ctx) => restoreBranch(ctx));
 
-  pi.on("turn_end", () => {
-    // Append a custom entry so state survives restarts independently
-    // of tool results alone
-    persistTodoState(pi);
-  });
+  pi.on("turn_end", () => persistTodoState());
 
   // ── System prompt injection ───────────────────────────────────────────────
 
   pi.on("before_agent_start", async (event, ctx) => {
-    // Hooks can preseed TODOs during session_start. Re-apply here too so the
-    // prompt is correct even if extension load order caused todo's
-    // session_start handler to run before hooks appended todo-preseed entries.
+    // Hooks may append preseeds after our session_start handler. Re-check the
+    // current branch immediately before constructing the prompt.
     if (applyPreseedEntries(ctx) > 0) {
-      persistTodoState(pi);
-      updateWidget(ctx);
+      persistTodoState();
+      updateWidget(ctx, todos);
     }
 
-    const todoSummary = formatTodosForPrompt();
+    const todoSummary = capToolText(formatTodosForPrompt(todos));
     const base = event.systemPrompt ?? "";
     return {
       systemPrompt: `${base}
@@ -790,6 +1000,286 @@ ${todoSummary}
 Use the \`todo\` tool to manage this list. Keep it updated as you work through tasks.`,
     };
   });
+
+  const executeTodo = async (params: any, ctx: ExtensionContext) => {
+    const action = params?.action;
+    const knownActions = new Set(["list", "add", "update", "toggle", "batch", "clear_done", "reorder"]);
+    if (!knownActions.has(action)) throw new Error(`todo: unknown action '${String(action)}'`);
+
+    const result = (text: string, details: TodoDetails) => ({
+      content: [{ type: "text" as const, text: capToolText(text) }],
+      details,
+    });
+    const requireId = (value: unknown, operation: string): number =>
+      positiveInteger(value, `${operation} id`);
+    const checkedStatus = (value: unknown, field: string): TodoStatus | undefined => {
+      if (value === undefined) return undefined;
+      if (!isTodoStatus(value)) throw new Error(`todo: '${field}' has an invalid status`);
+      return value;
+    };
+    const checkedPriority = (value: unknown, field: string): TodoPriority | undefined => {
+      if (value === undefined) return undefined;
+      if (!isTodoPriority(value)) throw new Error(`todo: '${field}' has an invalid priority`);
+      return value;
+    };
+
+    switch (action) {
+      case "list": {
+        const status = checkedStatus(params.status, "status");
+        const assignee =
+          params.assignee === undefined
+            ? undefined
+            : boundedString(params.assignee, "assignee", TODO_LIMITS.maxAssigneeBytes)!;
+        let filtered = todos.map(cloneTodo);
+        if (status) filtered = filtered.filter((todo) => todo.status === status);
+        if (assignee) filtered = filtered.filter((todo) => todo.assignee === assignee);
+        filtered = sortTodos(filtered);
+        const text =
+          filtered.length === 0
+            ? "No todos match the filter."
+            : `## TODO List (${filtered.length} items)\n\n${todoToMarkdown(filtered)}\n\n---\nUse \`todo add\` to create tasks, \`todo update\` to modify, \`todo toggle\` to mark done/undone.`;
+        return result(text, finishTodoAction("list", undefined, ctx));
+      }
+
+      case "add": {
+        if (todos.length >= TODO_LIMITS.maxTodos) {
+          throw new Error(`todo: cannot exceed ${TODO_LIMITS.maxTodos} todos`);
+        }
+        const text = boundedString(params.text, "text", TODO_LIMITS.maxTextBytes)!;
+        const status = checkedStatus(params.newStatus ?? params.status, "status") ?? "pending";
+        const priority = checkedPriority(params.priority, "priority") ?? "medium";
+        const dependencies = params.dependencies === undefined ? [] : validateDependencies(params.dependencies);
+        const assignee = optionalStoredString(params.assignee, "assignee", TODO_LIMITS.maxAssigneeBytes);
+        const notes = optionalStoredString(params.notes, "notes", TODO_LIMITS.maxNotesBytes);
+        const now = Date.now();
+        const candidate = cloneSnapshot(currentSnapshot());
+        const newTodo: Todo = {
+          id: candidate.nextId++,
+          text,
+          status,
+          priority,
+          dependencies,
+          assignee,
+          notes,
+          createdAt: now,
+          updatedAt: now,
+        };
+        candidate.todos.push(newTodo);
+        commitSnapshot(validateSnapshot(candidate));
+        return result(
+          `✓ Added #${newTodo.id}: ${newTodo.text} [${newTodo.status}] priority=${newTodo.priority}${newTodo.assignee ? ` @${newTodo.assignee}` : ""}`,
+          finishTodoAction("add", `Added #${newTodo.id}`, ctx),
+        );
+      }
+
+      case "update": {
+        const id = requireId(params.id, "update");
+        const candidate = cloneSnapshot(currentSnapshot());
+        const todo = candidate.todos.find((item) => item.id === id);
+        if (!todo) throw new Error(`todo: Todo #${id} not found`);
+        const changes: string[] = [];
+
+        if (params.newText !== undefined) {
+          todo.text = boundedString(params.newText, "newText", TODO_LIMITS.maxTextBytes)!;
+          changes.push("text");
+        }
+        const status = checkedStatus(params.newStatus ?? params.status, "newStatus");
+        if (status !== undefined) {
+          todo.status = status;
+          changes.push(`status→${status}`);
+        }
+        const priority = checkedPriority(params.newPriority, "newPriority");
+        if (priority !== undefined) {
+          todo.priority = priority;
+          changes.push(`priority→${priority}`);
+        }
+        if (params.newAssignee !== undefined) {
+          const value = boundedString(params.newAssignee, "newAssignee", TODO_LIMITS.maxAssigneeBytes, {
+            allowEmpty: true,
+          })!;
+          todo.assignee = value || undefined;
+          changes.push(`assignee→${value || "(unassigned)"}`);
+        }
+        if (params.newNotes !== undefined) {
+          const value = boundedString(params.newNotes, "newNotes", TODO_LIMITS.maxNotesBytes, { allowEmpty: true })!;
+          todo.notes = value || undefined;
+          changes.push("notes");
+        }
+        if (params.newDependencies !== undefined) {
+          todo.dependencies = validateDependencies(params.newDependencies, "newDependencies");
+          changes.push(`deps→[${todo.dependencies.join(",")}]`);
+        }
+        todo.updatedAt = Date.now();
+        commitSnapshot(validateSnapshot(candidate));
+        return result(
+          `✓ Updated #${todo.id}: ${todo.text}\nChanges: ${changes.join(", ") || "(none)"}`,
+          finishTodoAction("update", `Updated #${todo.id}`, ctx),
+        );
+      }
+
+      case "toggle": {
+        const id = requireId(params.id, "toggle");
+        const candidate = cloneSnapshot(currentSnapshot());
+        const todo = candidate.todos.find((item) => item.id === id);
+        if (!todo) throw new Error(`todo: Todo #${id} not found`);
+        todo.status = todo.status === "done" ? "pending" : todo.status === "cancelled" ? "pending" : "done";
+        todo.updatedAt = Date.now();
+        commitSnapshot(validateSnapshot(candidate));
+        return result(
+          `✓ Todo #${todo.id} marked as ${todo.status}: ${todo.text}`,
+          finishTodoAction("toggle", `Toggled #${todo.id}`, ctx),
+        );
+      }
+
+      case "clear_done": {
+        const candidate = cloneSnapshot(currentSnapshot());
+        const before = candidate.todos.length;
+        candidate.todos = candidate.todos.filter((todo) => todo.status !== "done" && todo.status !== "cancelled");
+        const removed = before - candidate.todos.length;
+        commitSnapshot(validateSnapshot(candidate));
+        return result(
+          removed === 0 ? "No completed todos to clear." : `✓ Cleared ${removed} completed/cancelled todos.`,
+          finishTodoAction("clear_done", removed > 0 ? `Cleared ${removed}` : undefined, ctx),
+        );
+      }
+
+      case "reorder": {
+        if (!Array.isArray(params.order) || params.order.length === 0) {
+          throw new Error("todo: 'order' must be a non-empty array of IDs");
+        }
+        if (params.order.length > TODO_LIMITS.maxTodos) {
+          throw new Error(`todo: 'order' exceeds ${TODO_LIMITS.maxTodos} IDs`);
+        }
+        const order = params.order.map((id: unknown, index: number) => positiveInteger(id, `order[${index}]`));
+        if (new Set(order).size !== order.length) throw new Error("todo: 'order' contains duplicate IDs");
+        const missing = order.filter((id: number) => !todos.some((todo) => todo.id === id));
+        if (missing.length > 0) throw new Error(`todo: IDs not found: ${missing.join(", ")}`);
+
+        const candidate = cloneSnapshot(currentSnapshot());
+        candidate.todos = sortTodos(candidate.todos);
+        const orderMap = new Map(order.map((id: number, index: number) => [id, index]));
+        candidate.todos.sort((a, b) => {
+          const ai = orderMap.get(a.id);
+          const bi = orderMap.get(b.id);
+          if (ai !== undefined && bi !== undefined) return ai - bi;
+          if (ai !== undefined) return -1;
+          if (bi !== undefined) return 1;
+          return 0;
+        });
+        const now = Date.now();
+        candidate.todos.forEach((todo, rank) => {
+          todo.rank = rank;
+          todo.updatedAt = now;
+        });
+        commitSnapshot(validateSnapshot(candidate));
+        return result(
+          `✓ Reordered ${order.length} todos.`,
+          finishTodoAction("reorder", "Reordered", ctx),
+        );
+      }
+
+      case "batch": {
+        if (!Array.isArray(params.items) || params.items.length === 0) {
+          throw new Error("todo: 'items' must be a non-empty array");
+        }
+        if (params.items.length > TODO_LIMITS.maxBatchItems) {
+          throw new Error(`todo: 'items' exceeds ${TODO_LIMITS.maxBatchItems} operations`);
+        }
+
+        // Stage every operation against a detached snapshot. Any invalid item
+        // throws before the live instance state is replaced.
+        const candidate = cloneSnapshot(currentSnapshot());
+        const results: string[] = [];
+        for (let index = 0; index < params.items.length; index++) {
+          const item = params.items[index];
+          if (!item || typeof item !== "object") throw new Error(`todo: items[${index}] must be an object`);
+          switch (item.action) {
+            case "add": {
+              if (candidate.todos.length >= TODO_LIMITS.maxTodos) {
+                throw new Error(`todo: cannot exceed ${TODO_LIMITS.maxTodos} todos`);
+              }
+              const text = boundedString(item.text, `items[${index}].text`, TODO_LIMITS.maxTextBytes)!;
+              const status = checkedStatus(item.status, `items[${index}].status`) ?? "pending";
+              const priority = checkedPriority(item.priority, `items[${index}].priority`) ?? "medium";
+              const assignee = optionalStoredString(
+                item.assignee,
+                `items[${index}].assignee`,
+                TODO_LIMITS.maxAssigneeBytes,
+              );
+              const now = Date.now() + index;
+              const todo: Todo = {
+                id: candidate.nextId++,
+                text,
+                status,
+                priority,
+                dependencies: [],
+                assignee,
+                createdAt: now,
+                updatedAt: now,
+              };
+              candidate.todos.push(todo);
+              results.push(`✓ Added #${todo.id}: ${todo.text}`);
+              break;
+            }
+            case "update": {
+              const id = requireId(item.id, `items[${index}].update`);
+              const todo = candidate.todos.find((entry) => entry.id === id);
+              if (!todo) throw new Error(`todo: items[${index}] Todo #${id} not found`);
+              if (item.text !== undefined) {
+                todo.text = boundedString(item.text, `items[${index}].text`, TODO_LIMITS.maxTextBytes)!;
+              }
+              const status = checkedStatus(item.status, `items[${index}].status`);
+              if (status !== undefined) todo.status = status;
+              const priority = checkedPriority(item.priority, `items[${index}].priority`);
+              if (priority !== undefined) todo.priority = priority;
+              if (item.assignee !== undefined) {
+                const value = boundedString(
+                  item.assignee,
+                  `items[${index}].assignee`,
+                  TODO_LIMITS.maxAssigneeBytes,
+                  { allowEmpty: true },
+                )!;
+                todo.assignee = value || undefined;
+              }
+              todo.updatedAt = Date.now() + index;
+              results.push(`✓ Updated #${todo.id}`);
+              break;
+            }
+            case "toggle": {
+              const id = requireId(item.id, `items[${index}].toggle`);
+              const todo = candidate.todos.find((entry) => entry.id === id);
+              if (!todo) throw new Error(`todo: items[${index}] Todo #${id} not found`);
+              todo.status = todo.status === "done" ? "pending" : "done";
+              todo.updatedAt = Date.now() + index;
+              results.push(`✓ Toggled #${todo.id}`);
+              break;
+            }
+            case "delete": {
+              const id = requireId(item.id, `items[${index}].delete`);
+              const todoIndex = candidate.todos.findIndex((entry) => entry.id === id);
+              if (todoIndex < 0) throw new Error(`todo: items[${index}] Todo #${id} not found`);
+              const [removed] = candidate.todos.splice(todoIndex, 1);
+              results.push(`✓ Deleted #${id}: ${removed.text}`);
+              break;
+            }
+            default:
+              throw new Error(`todo: unknown batch action '${String(item.action)}' at items[${index}]`);
+          }
+          // Bound transient staged state too, not only the final batch result.
+          validateSnapshot(candidate);
+        }
+        commitSnapshot(validateSnapshot(candidate));
+        return result(
+          `Batch complete (${params.items.length} operations):\n${results.join("\n")}`,
+          finishTodoAction("batch", `${params.items.length} operations`, ctx),
+        );
+      }
+    }
+
+    // The known-action guard above makes this unreachable, but retaining an
+    // explicit throw keeps the tool result type total under strict checking.
+    throw new Error(`todo: unknown action '${String(action)}'`);
+  };
 
   // ── Register todo tool ────────────────────────────────────────────────────
 
@@ -806,6 +1296,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
       "  batch - Perform multiple operations atomically",
       "  clear_done - Remove all completed and cancelled tasks",
       "  reorder - Change task ordering",
+      `Limits: ${TODO_LIMITS.maxTodos} todos; tool output is truncated below 48 KiB.`,
       "",
       "Use this tool proactively: before starting work, list todos; during work, mark in-progress;",
       "after completing a step, mark it done; if blocked, mark blocked and note dependencies.",
@@ -819,6 +1310,11 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
     parameters: TodoParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return executeTodo(params, ctx);
+
+      // All calls return through the validated implementation above. The
+      // legacy switch is unreachable and retained only to keep this focused
+      // state-correctness change independent of renderer/TUI source churn.
       switch (params.action) {
         case "list": {
           let filtered = [...todos];
@@ -1291,11 +1787,22 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
         return;
       }
 
+      let mutated = false;
       await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-        return new TodoManagerComponent(theme, () => {
-          updateWidget(ctx);
-          done();
-        });
+        return new TodoManagerComponent(
+          theme,
+          () => todos,
+          () => {
+            mutated = true;
+          },
+          () => {
+            // Manager edits do not produce a toolResult, so close is their
+            // durability boundary rather than the next eventual agent turn.
+            if (mutated) persistTodoState();
+            updateWidget(ctx, todos);
+            done();
+          },
+        );
       });
     },
   });
@@ -1308,7 +1815,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
         return;
       }
 
-      const summary = formatTodosForPrompt();
+      const summary = capToolText(formatTodosForPrompt(todos));
       pi.sendUserMessage(
         `Please re-evaluate the current TODO list. Review each task's status, priority, and dependencies. Update any that are outdated, mark completed work as done, and adjust priorities as needed.\n\nCurrent TODOs:\n${summary}`,
         {},
@@ -1322,7 +1829,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
     handler: async (_args, ctx) => {
       widgetEnabled = !widgetEnabled;
       if (widgetEnabled) {
-        updateWidget(ctx);
+        updateWidget(ctx, todos);
         ctx.ui.notify("TODO widget enabled.", "info");
       } else {
         ctx.ui.setWidget("todo", undefined);
