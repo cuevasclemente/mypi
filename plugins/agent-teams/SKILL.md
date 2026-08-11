@@ -59,10 +59,10 @@ For stateless work that doesn't need follow-up:
 
 | Tool | Purpose |
 |------|---------|
-| `goals_add` | Define a goal (optionally with a check command) |
+| `goals_add` | Define a bounded qualitative goal |
 | `goals_list` | List active goals |
-| `goals_check` | Run check commands against programmatic goals |
-| `goals_update` | Update progress or mark complete |
+| `goals_check` | Compatibility-only status report; never executes checks |
+| `goals_update` | Record verified progress or mark complete |
 | `goals_remove` | Remove a goal |
 
 ## Designing Subagent Identities
@@ -110,11 +110,11 @@ Goals you create with `goals_add` are automatically injected into subagent syste
 To create goals for a team task:
 
 ```
-goals_add("Find all PDF files in ~/Documents", check_command: "find ~/Documents -name '*.pdf' | head -1")
-goals_add("Find all PDF files in ~/Downloads")
+goals_add(description: "Find all PDF files in ~/Documents")
+goals_add(description: "Find all PDF files in ~/Downloads")
 ```
 
-After subagents complete work, run `goals_check` to verify programmatic goals, and `goals_update` to record progress on qualitative ones.
+Goals never contain executable checks. After subagents complete work, verify evidence through the orchestrator's normal authorized tools and use `goals_update` to record the outcome. `goals_check` remains only for compatibility with older calls and reports status without executing anything.
 
 ## Two Styles of Stateful Subagent
 
@@ -122,7 +122,7 @@ Stateful subagents come in two distinct shapes. Pick the right one via the `styl
 
 ### Style: `team-member` (default)
 
-The subagent owns a substantial task. It decomposes the task into its own goals, executes them, and reports goal-shaped status at end of turn.
+The subagent owns a substantial task. It decomposes the task into a private checklist, executes what its guarded path tools permit, and reports goal-shaped status at end of turn.
 
 When to pick this:
 - The task is open-ended and requires planning.
@@ -131,7 +131,7 @@ When to pick this:
 
 Examples: `pdf-indexer` building an index of all PDFs in `~/`, `migration-agent` upgrading a codebase, `auditor` reviewing a directory of contracts.
 
-Auto-injected guidance covers: end-of-turn message routing, `goals_add`/`check`/`update` usage, expected report shape.
+Auto-injected guidance covers end-of-turn message routing, the child path-tool boundary, private checklist use, and expected report shape. Child processes do not receive goals tools.
 
 ### Style: `worker`
 
@@ -191,7 +191,8 @@ subagent_poll() // polls all
 subagent_stop(id: "pdf-documents")
 subagent_stop(id: "pdf-downloads")
 
-goals_check()
+// Verify through normal authorized tools, then record the evidence.
+goals_update(index: 1, progress: "Verified by orchestrator", completed: true)
 ```
 
 ### Pattern 2: Worker Pool
@@ -301,18 +302,16 @@ This means the orchestrator naturally sees what subagents are doing without poll
 
 The semantics are deliberately the same in both single-subagent and team scenarios. The difference between them is purely the topology: in a team scenario, multiple subagents are alive simultaneously, the orchestrator can address any of them, and (eventually) subagents will be able to address each other. The end-of-turn-message-as-reply rule applies uniformly.
 
-## Subagents Track Their Own Goals
+## Subagents Use Private Checklists
 
-Subagents spawned with `style: "team-member"` (the default) are instructed at spawn time to use `goals_add`/`goals_check`/`goals_update` to track their own work. Their goal list is independent from yours — it's their personal task breakdown.
+Subagents spawned with `style: "team-member"` (the default) do not receive goals tools. They use a short private checklist and report its status in the final message. They also do not receive bash or other process-execution tools; when verification needs command execution, they must ask the orchestrator to perform it through the normal authorized surface.
 
-Why: when a team-member subagent ends a turn, its natural report is "here are the goals I set, here's the status of each." This makes their messages back to you well-structured without you having to ask for it. Expect to see reports like:
+A useful report still looks goal-shaped:
 
 ```
-✓ Indexed all PDFs in ~/Downloads (verified by ls count = 42)
+✓ Indexed all PDFs visible through the guarded path tools
 ✓ Computed sizes for each
-✗ Cross-reference with ~/Documents — blocked, permission denied on ~/Documents/private
+✗ Command-based validation — orchestrator must run it through the authorized command surface
 ```
 
-This pattern reduces the need for you to ask follow-up questions. If a team-member subagent's report is vague, that often means they didn't set goals — a follow-up `subagent_send` asking them to break the work into goals is usually the right move.
-
-Worker-style subagents (`style: "worker"`) are explicitly told NOT to set goals — there is no project, just a stream of independent requests. Their reports are per-request, not per-goal.
+Worker-style subagents (`style: "worker"`) also do not create goals; there is no project, just a stream of independent requests. Their reports are per-request, not per-goal.

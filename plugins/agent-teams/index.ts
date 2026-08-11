@@ -27,9 +27,31 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  MAX_GOALS,
+  MAX_GOAL_DESCRIPTION_BYTES,
+  MAX_GOAL_PROGRESS_BYTES,
   type Goal,
+  TEAM_GOALS_ENTRY_TYPE,
+  allocateGoalId,
+  buildGoalsCheckReport,
+  buildGoalsSystemPrompt,
+  capGoalToolOutput,
+  capGoalsContext,
+  filterHistoricalGoalsContextMessages,
   formatGoalsForPrompt,
+  prepareGoalAddArguments,
+  requireGoalAggregateSize,
+  requireGoalDescription,
+  requireGoalIndex,
+  requireGoalProgress,
+  restoreGoalsFromCurrentBranch,
+  snapshotGoal,
+  snapshotGoals,
 } from "./goals.js";
+import {
+  AGENT_TEAMS_TOOL_NAME_SET,
+  withoutAgentTeamsTools,
+} from "./tool-names.js";
 import {
   SubagentManager,
   type SubagentSpec,
@@ -74,7 +96,6 @@ export default function (pi: ExtensionAPI) {
   const subagentManager = new SubagentManager();
   let goals: Goal[] = [];
   let companionToolsDisabled = false;
-  let nextGoalId = 1;
   let privilegedRuntimeKey: string | null = null;
 
   const privilegedError = (message: string): PrivilegedExecResult => ({
@@ -113,28 +134,20 @@ export default function (pi: ExtensionAPI) {
   // ── Helpers ────────────────────────────────────────────────────────────
 
   function persistGoals(): void {
-    pi.appendEntry("team-goals", { goals });
+    requireGoalAggregateSize(goals);
+    const snapshot = snapshotGoals(goals);
+    pi.appendEntry(TEAM_GOALS_ENTRY_TYPE, Object.freeze({ goals: snapshot }));
+  }
+
+  function commitGoals(nextGoals: readonly Goal[]): void {
+    requireGoalAggregateSize(nextGoals);
+    goals = nextGoals.map((goal) => ({ ...goal }));
+    persistGoals();
   }
 
   function restoreGoals(ctx: ExtensionContext): void {
-    const entries = ctx.sessionManager.getEntries();
-    const goalEntry = entries
-      .filter((e: any) => e.type === "custom" && e.customType === "team-goals")
-      .pop() as { data?: { goals: Goal[] } } | undefined;
-    if (goalEntry?.data?.goals) {
-      goals = goalEntry.data.goals;
-      nextGoalId = goals.length + 1;
-    }
+    goals = restoreGoalsFromCurrentBranch(ctx.sessionManager);
   }
-
-  const SUBAGENT_TOOL_NAMES = new Set([
-    "subagent_spawn",
-    "subagent_send",
-    "subagent_poll",
-    "subagent_stop",
-    "subagent_list",
-    "subagent_dispatch",
-  ]);
 
   const activeToolNames = (): string[] => activeToolNamesFromApi(pi.getActiveTools() as unknown);
   const executionPolicy = (ctx: ExtensionContext): SubagentExecutionPolicy => ({
@@ -168,25 +181,32 @@ export default function (pi: ExtensionAPI) {
     parentSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
   });
 
-  const enforceCompanionToolAvailability = async (ctx: ExtensionContext): Promise<void> => {
+  const enforceCompanionToolAvailability = async (ctx: ExtensionContext): Promise<boolean> => {
+    if (companionToolsDisabled) return false;
     try {
       await authorizeChildForAvailability(ctx);
+      return true;
     } catch (error) {
-      if (!companionToolsDisabled) {
-        const reason = error instanceof Error ? error.message : "unknown companion-policy denial";
-        console.warn(`[agent-teams] disabling subagent tools: ${reason}`);
-        const retained = activeToolNames().filter((name) => !SUBAGENT_TOOL_NAMES.has(name));
-        pi.setActiveTools(retained);
-        companionToolsDisabled = true;
-      }
+      const reason = error instanceof Error ? error.message : "unknown companion-policy denial";
+      console.warn(`[agent-teams] disabling all Agent Teams tools: ${reason}`);
+      pi.setActiveTools(withoutAgentTeamsTools(activeToolNames()));
+      companionToolsDisabled = true;
       await subagentManager.stopAll();
+      return false;
     }
   };
 
-  // Frontend entry preflight. execute() and each process manager/runner repeat
-  // this check, so later argument mutation or a stale projection cannot bypass it.
+  // Re-check availability at every Agent Teams tool entry. This removes the
+  // complete extension surface on protected/denied/unknown/stale policy, not
+  // just process-spawning tools. Spawn/dispatch then perform argument-specific
+  // preflight, and each process manager/runner repeats it before creation.
   pi.on("tool_call", async (event, ctx) => {
+    if (!AGENT_TEAMS_TOOL_NAME_SET.has(event.toolName)) return;
+    if (!await enforceCompanionToolAvailability(ctx)) {
+      return { block: true, reason: "Agent Teams is disabled by companion policy" };
+    }
     if (event.toolName !== "subagent_spawn" && event.toolName !== "subagent_dispatch") return;
+
     const input = event.input as any;
     try {
       if (event.toolName === "subagent_spawn") {
@@ -221,6 +241,10 @@ export default function (pi: ExtensionAPI) {
     await enforceCompanionToolAvailability(ctx);
   });
 
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreGoals(ctx);
+  });
+
   pi.on("session_shutdown", async () => {
     subagentManager.setPrivilegedExecHandler(undefined);
     privilegedRuntimeKey = null;
@@ -229,20 +253,20 @@ export default function (pi: ExtensionAPI) {
 
   // ── Inject goals context ───────────────────────────────────────────────
 
-  pi.on("before_agent_start", async (_event, ctx) => {
-    await enforceCompanionToolAvailability(ctx);
-    if (goals.length === 0) return;
-    const activeGoals = goals.filter((g) => !g.completed);
-    if (activeGoals.length === 0) return;
+  // Migration-only context cleanup: old releases persisted this otherwise
+  // turn-local context as hidden custom messages. Keep the session untouched,
+  // but never send those historical snapshots to a provider again.
+  pi.on("context", (event) => ({
+    messages: filterHistoricalGoalsContextMessages(event.messages),
+  }));
 
-    const goalsText = formatGoalsForPrompt(activeGoals);
-    return {
-      message: {
-        customType: "team-goals-context",
-        content: `## Active Goals\n\n${goalsText}\n\nUse the \`goals\` tools to check, update, and manage progress on these goals.`,
-        display: false,
-      },
-    };
+  pi.on("before_agent_start", async (event, ctx) => {
+    const companionAllowed = await enforceCompanionToolAvailability(ctx);
+    if (!companionAllowed) return;
+
+    const systemPrompt = buildGoalsSystemPrompt(event.systemPrompt, goals, companionAllowed);
+    if (systemPrompt === undefined) return;
+    return { systemPrompt };
   });
 
   // ── Commands ───────────────────────────────────────────────────────────
@@ -257,9 +281,8 @@ export default function (pi: ExtensionAPI) {
       const lines = goals
         .map((g, i) => {
           const icon = g.completed ? "✓" : "○";
-          const type = g.checkCommand ? "programmatic" : "qualitative";
           const progress = g.progress ? `\n   Progress: ${g.progress}` : "";
-          return `${icon} [${i + 1}] ${g.description} (${type})${progress}`;
+          return `${icon} [${i + 1}] ${g.description}${progress}`;
         })
         .join("\n\n");
       ctx.ui.notify(`Goals:\n\n${lines}`, "info");
@@ -267,54 +290,75 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("goals:add", {
-    description: "Add a new goal (description or description | checkCommand)",
+    description: "Add a qualitative goal (legacy check commands are ignored and never stored)",
     handler: async (args, ctx) => {
       if (!args?.trim()) {
-        ctx.ui.notify("Usage: /goals:add <description> [| <check command>]", "error");
+        ctx.ui.notify("Usage: /goals:add <description>", "error");
+        return;
+      }
+      if (goals.length >= MAX_GOALS) {
+        ctx.ui.notify(`Goal limit reached (${MAX_GOALS}). Remove a goal before adding another.`, "error");
         return;
       }
 
       const pipeIdx = args.indexOf("|");
-      let description = args;
-      let checkCommand: string | undefined;
-
-      if (pipeIdx !== -1) {
-        description = args.slice(0, pipeIdx).trim();
-        checkCommand = args.slice(pipeIdx + 1).trim() || undefined;
+      const description = (pipeIdx === -1 ? args : args.slice(0, pipeIdx)).trim();
+      const ignoredLegacyCheck = pipeIdx !== -1 && args.slice(pipeIdx + 1).trim().length > 0;
+      if (!description || Buffer.byteLength(description, "utf8") > MAX_GOAL_DESCRIPTION_BYTES) {
+        ctx.ui.notify(`Goal description must be non-empty and at most ${MAX_GOAL_DESCRIPTION_BYTES} UTF-8 bytes.`, "error");
+        return;
       }
 
       const goal: Goal = {
-        id: `goal-${nextGoalId++}`,
+        id: allocateGoalId(goals),
         description,
-        checkCommand,
         completed: false,
         createdAt: Date.now(),
       };
 
-      goals.push(goal);
-      persistGoals();
+      try {
+        commitGoals([...goals, goal]);
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : "Goal storage limit exceeded.", "error");
+        return;
+      }
 
-      const type = checkCommand ? ` (check: \`${checkCommand}\`)` : " (qualitative)";
-      ctx.ui.notify(`Goal added: ${description}${type}`, "success");
+      ctx.ui.notify(
+        ignoredLegacyCheck
+          ? `Goal added: ${description}. Legacy check command ignored; it was not stored or executed.`
+          : `Goal added: ${description}`,
+        ignoredLegacyCheck ? "warning" : "success",
+      );
     },
   });
 
   pi.registerCommand("goals:done", {
     description: "Mark a goal as completed by index number",
     handler: async (args, ctx) => {
-      const idx = parseInt(args?.trim() ?? "", 10) - 1;
-      if (isNaN(idx) || idx < 0 || idx >= goals.length) {
+      const rawIndex = args?.trim() ?? "";
+      const idx = /^[1-9][0-9]*$/.test(rawIndex) ? Number(rawIndex) - 1 : -1;
+      if (!Number.isSafeInteger(idx) || idx < 0 || idx >= goals.length) {
         ctx.ui.notify(
           `Invalid goal index. Use /goals to see numbered goals. Current: ${goals.length} goal(s).`,
           "error",
         );
         return;
       }
-      goals[idx].completed = true;
-      goals[idx].completedAt = Date.now();
-      goals[idx].progress = "Completed";
-      persistGoals();
-      ctx.ui.notify(`Goal marked complete: ${goals[idx].description}`, "success");
+      const completedGoal: Goal = {
+        ...goals[idx],
+        completed: true,
+        completedAt: Date.now(),
+        progress: "Completed",
+      };
+      const nextGoals = [...goals];
+      nextGoals[idx] = completedGoal;
+      try {
+        commitGoals(nextGoals);
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : "Goal storage limit exceeded.", "error");
+        return;
+      }
+      ctx.ui.notify(`Goal marked complete: ${completedGoal.description}`, "success");
     },
   });
 
@@ -395,21 +439,15 @@ export default function (pi: ExtensionAPI) {
         "## Working Style: Team Member",
         "You own a substantial task. The orchestrator handed you a goal; you decide how to break it down and execute it.",
         "",
-        "## Tracking Your Own Work With Goals",
-        "You have access to the same `goals_add` / `goals_check` / `goals_update` / `goals_list` tools the orchestrator has. Your goal list is *your own* (independent of the orchestrator's).",
+        "## Child Tool Boundary",
+        "You receive only the guarded path tools authorized for this task: `read`, `edit`, `write`, `grep`, `find`, and/or `ls`. You do not have bash, goals tools, sudo, or other custom tools. Do not claim or attempt unavailable capabilities.",
         "",
-        "You are strongly encouraged to create your own goals as soon as you receive a non-trivial task:",
-        "- Decompose the task into 2–6 concrete goals.",
-        "- Use `check_command` for any goal that can be programmatically verified (file exists, test passes, grep finds X). Use qualitative goals for the rest.",
-        "- As you work, run `goals_check` to see which programmatic goals have flipped to done.",
-        "- Mark qualitative goals complete via `goals_update` when you finish them.",
-        "",
-        "Why this matters: at the end of each turn, your goal list is the natural skeleton of your report. Instead of inventing structure on the fly, glance at your goals and tell the orchestrator: which ones are done, which ones are blocked, which ones are still open. This makes your final message clear, honest, and easy for the orchestrator to act on.",
+        "Break the task into a short private checklist in your reasoning and report which items are done, blocked, or still open. When verification would require command execution, report that the orchestrator must run it through the normal authorized command surface.",
         "",
         "A good final message often looks like:",
         "```",
         "Done with the assigned work.",
-        "✓ Goal 1: <short description> — verified by <check>",
+        "✓ Goal 1: <short description> — evidence: <authorized observation>",
         "✓ Goal 2: <short description>",
         "✗ Goal 3: <short description> — blocked because <reason>",
         "… Goal 4: <short description> — still in progress; next step is <X>",
@@ -440,7 +478,7 @@ export default function (pi: ExtensionAPI) {
       "The subagent inherits your current model by default. Only override model when the user asks for a specific model or when the task needs special capabilities.",
       "Use subagent_send to communicate iteratively, subagent_poll to check progress, subagent_stop when done.",
       "For one-shot stateless work, prefer subagent_dispatch.",
-      "Pick a `style` that matches the pattern: 'team-member' (default) for substantive owned work that decomposes into goals; 'worker' for narrow request/reply roles like a dictionary or thesaurus that don't have a project to plan; 'minimal' when your system_prompt already says everything needed and you want no auto-injected coaching.",
+      "Pick a `style` that matches the pattern: 'team-member' (default) for substantive owned work using a private checklist; 'worker' for narrow request/reply roles like a dictionary or thesaurus that don't have a project to plan; 'minimal' when your system_prompt already says everything needed and you want no auto-injected coaching.",
     ],
     parameters: Type.Object({
       id: SubagentId,
@@ -458,7 +496,7 @@ export default function (pi: ExtensionAPI) {
           [Type.Literal("team-member"), Type.Literal("worker"), Type.Literal("minimal")],
           {
             description:
-              "Coaching style for this subagent. 'team-member' (default): owns a substantial task, decomposes it into its own goals, reports goal-shaped status. 'worker': narrow role serving requests one-at-a-time, no goals, terse per-request replies. 'minimal': only the universal end-of-turn-message-is-your-reply rule; orchestrator owns all other guidance via system_prompt.",
+              "Coaching style for this subagent. 'team-member' (default): owns a substantial task, uses a private checklist within its guarded path-tool boundary, and reports goal-shaped status. 'worker': narrow role serving requests one-at-a-time, no goals, terse per-request replies. 'minimal': only the universal end-of-turn-message-is-your-reply rule; orchestrator owns all other guidance via system_prompt.",
           },
         ),
       ),
@@ -466,34 +504,24 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const systemPrompt = params.system_prompt?.trim();
       if (!systemPrompt) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "subagent_spawn requires a non-empty 'system_prompt'. Design the subagent's identity (role, scope, constraints) explicitly at creation time — there are no predefined identities to reference.",
-            },
-          ],
-          details: {},
-          isError: true,
-        };
+        throw new Error(
+          "subagent_spawn requires a non-empty 'system_prompt'. Design the subagent's identity (role, scope, constraints) explicitly at creation time — there are no predefined identities to reference.",
+        );
       }
 
       // Validate parent exists if specified
       if (params.parent_id && !subagentManager.has(params.parent_id)) {
-        return {
-          content: [{ type: "text", text: `Parent subagent "${params.parent_id}" not found.` }],
-          details: {},
-          isError: true,
-        };
+        throw new Error(`Parent subagent "${params.parent_id}" not found.`);
       }
 
       // Inject active goals into the subagent's system prompt
       const activeGoals = goals.filter((g) => !g.completed);
       let enrichedPrompt = systemPrompt;
       if (activeGoals.length > 0) {
-        const goalsContext = formatGoalsForPrompt(activeGoals);
-        enrichedPrompt = `${systemPrompt}\n\n## Active Team Goals\nThe following goals are being tracked by the orchestrator. Work towards these goals as applicable to your scope.\n\n${goalsContext}`;
+        const goalsContext = capGoalsContext(
+          `## Active Team Goals\nThe following goals are being tracked by the orchestrator. Work towards these goals as applicable to your scope.\n\n${formatGoalsForPrompt(activeGoals)}`,
+        );
+        enrichedPrompt = `${systemPrompt}\n\n${goalsContext}`;
       }
 
       // Teach the subagent how reporting works (style-dependent).
@@ -508,11 +536,9 @@ export default function (pi: ExtensionAPI) {
       try {
         authorization = authorizeChild(ctx, params.cwd, params.tools);
       } catch (error) {
-        return {
-          content: [{ type: "text", text: `Companion policy denied subagent spawn: ${error instanceof Error ? error.message : String(error)}` }],
-          details: {},
-          isError: true,
-        };
+        throw new Error(
+          `Companion policy denied subagent spawn: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
       const parentTools = activeToolNames();
       const spec: SubagentSpec = {
@@ -548,11 +574,7 @@ export default function (pi: ExtensionAPI) {
           details: { status: updatedStatus },
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Failed to spawn subagent: ${err.message}` }],
-          details: {},
-          isError: true,
-        };
+        throw new Error(`Failed to spawn subagent: ${err.message}`);
       }
     },
     renderCall(args, theme, _context) {
@@ -564,11 +586,11 @@ export default function (pi: ExtensionAPI) {
       text += `\n  ${theme.fg("dim", preview)}`;
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme, _context) {
+    renderResult(result, _options, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-      return new Text(`${icon} ${theme.fg("toolOutput", content.split("\n")[0])}`, 0, 0);
+      const icon = context.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      return new Text(`${icon} ${theme.fg(context.isError ? "error" : "toolOutput", content.split("\n")[0])}`, 0, 0);
     },
   });
 
@@ -588,20 +610,13 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!subagentManager.has(params.id)) {
-        return {
-          content: [{ type: "text", text: `Subagent "${params.id}" not found. Use subagent_list to see active agents.` }],
-          details: {},
-          isError: true,
-        };
+        throw new Error(`Subagent "${params.id}" not found. Use subagent_list to see active agents.`);
       }
 
       try {
         const response = await subagentManager.send(params.id, params.message);
         if (!response) {
-          return {
-            content: [{ type: "text", text: `Subagent "${params.id}" did not produce a response. It may have stopped.` }],
-            details: {},
-          };
+          throw new Error(`Subagent "${params.id}" did not produce a response. It may have stopped.`);
         }
 
         const status = subagentManager.getStatus(params.id);
@@ -615,11 +630,7 @@ export default function (pi: ExtensionAPI) {
           details: { status },
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Failed to send to subagent: ${err.message}` }],
-          details: {},
-          isError: true,
-        };
+        throw new Error(`Failed to send to subagent: ${err.message}`);
       }
     },
     renderCall(args, theme, _context) {
@@ -634,12 +645,13 @@ export default function (pi: ExtensionAPI) {
         theme.fg("dim", ` "${preview}"`);
       return new Text(text, 0, 0);
     },
-    renderResult(result, { expanded }, theme, _context) {
+    renderResult(result, { expanded }, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "→");
-      if (expanded) return new Text(`${icon} ${theme.fg("toolOutput", content)}`, 0, 0);
-      return new Text(`${icon} ${theme.fg("toolOutput", content.split("\n")[0])}`, 0, 0);
+      const icon = context.isError ? theme.fg("error", "✗") : theme.fg("success", "→");
+      const color = context.isError ? "error" : "toolOutput";
+      if (expanded) return new Text(`${icon} ${theme.fg(color, content)}`, 0, 0);
+      return new Text(`${icon} ${theme.fg(color, content.split("\n")[0])}`, 0, 0);
     },
   });
 
@@ -660,17 +672,12 @@ export default function (pi: ExtensionAPI) {
       wait: Type.Optional(Type.Boolean({ description: "If true, block until the subagent is idle, then return full output. Only valid when 'id' is provided." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (params.wait && !params.id) {
+        throw new Error("subagent_poll wait:true requires an id.");
+      }
       if (params.id) {
         if (!subagentManager.has(params.id)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Subagent "${params.id}" not found. Use subagent_list to see active agents.`,
-              },
-            ],
-            details: {},
-          };
+          throw new Error(`Subagent "${params.id}" not found. Use subagent_list to see active agents.`);
         }
 
         // If wait is requested, block until idle, then return full output
@@ -679,11 +686,9 @@ export default function (pi: ExtensionAPI) {
             await subagentManager.waitForIdle(params.id, 300000, signal); // 5 min timeout, abortable
           } catch (err: any) {
             const status = subagentManager.getStatus(params.id);
-            return {
-              content: [{ type: "text", text: `${err.message}. Current status: ${status.status} (${status.messages.length} msgs).` }],
-              details: { status },
-              isError: true,
-            };
+            throw new Error(
+              `${err.message}. Current status: ${status.status} (${status.messages.length} msgs).`,
+            );
           }
 
           const status = subagentManager.getStatus(params.id);
@@ -752,14 +757,16 @@ export default function (pi: ExtensionAPI) {
       const text = theme.fg("toolTitle", theme.bold("poll ")) + theme.fg("accent", id);
       return new Text(text, 0, 0);
     },
-    renderResult(result, { expanded }, theme, _context) {
+    renderResult(result, { expanded }, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      if (expanded) return new Text(theme.fg("toolOutput", content), 0, 0);
+      const color = context.isError ? "error" : "toolOutput";
+      const icon = context.isError ? `${theme.fg("error", "✗")} ` : "";
+      if (expanded) return new Text(icon + theme.fg(color, content), 0, 0);
       const firstLine = content.split("\n")[0];
       const rest = content.split("\n").length - 1;
       return new Text(
-        `${theme.fg("toolOutput", firstLine)}${rest > 0 ? theme.fg("dim", ` (+${rest} lines)`) : ""}`,
+        `${icon}${theme.fg(color, firstLine)}${rest > 0 ? theme.fg("dim", ` (+${rest} lines)`) : ""}`,
         0,
         0,
       );
@@ -792,10 +799,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!subagentManager.has(params.id)) {
-        return {
-          content: [{ type: "text", text: `Subagent "${params.id}" not found.` }],
-          details: {},
-        };
+        throw new Error(`Subagent "${params.id}" not found.`);
       }
 
       const familySize = subagentManager.familySize(params.id);
@@ -818,11 +822,11 @@ export default function (pi: ExtensionAPI) {
       const text = theme.fg("toolTitle", theme.bold("stop ")) + theme.fg("accent", args.id || "...");
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme, _context) {
+    renderResult(result, _options, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-      return new Text(`${icon} ${theme.fg("toolOutput", content)}`, 0, 0);
+      const icon = context.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      return new Text(`${icon} ${theme.fg(context.isError ? "error" : "toolOutput", content)}`, 0, 0);
     },
   });
 
@@ -964,21 +968,13 @@ export default function (pi: ExtensionAPI) {
         });
 
       if (modeCount !== 1) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "Invalid parameters. Provide exactly one mode:\n" +
-                "  • single: name + system_prompt + task\n" +
-                "  • parallel: tasks: [{name, system_prompt, task}, ...]\n" +
-                "  • chain: chain: [{name, system_prompt, task}, ...]\n\n" +
-                "Each task must carry its own designed identity (no predefined identities exist).",
-            },
-          ],
-          details: makeDetails("single")([]),
-          isError: true,
-        };
+        throw new Error(
+          "Invalid parameters. Provide exactly one mode:\n" +
+          "  • single: name + system_prompt + task\n" +
+          "  • parallel: tasks: [{name, system_prompt, task}, ...]\n" +
+          "  • chain: chain: [{name, system_prompt, task}, ...]\n\n" +
+          "Each task must carry its own designed identity (no predefined identities exist).",
+        );
       }
 
       // ── Helper: resolve model with orchestrator default ──
@@ -1031,16 +1027,9 @@ export default function (pi: ExtensionAPI) {
       // ── Parallel mode ──
       if (hasTasks) {
         if (params.tasks!.length > MAX_PARALLEL_TASKS) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-              },
-            ],
-            details: makeDetails("parallel")([]),
-            isError: true,
-          };
+          throw new Error(
+            `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+          );
         }
 
         const results = await runParallelAgents(
@@ -1178,11 +1167,13 @@ export default function (pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded }, theme, _context) {
+    renderResult(result, { expanded }, theme, context) {
       const details = result.details as SubagentDetails | undefined;
       if (!details || details.results.length === 0) {
         const text = result.content[0];
-        return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+        const content = text?.type === "text" ? text.text : "(no output)";
+        const icon = context.isError ? `${theme.fg("error", "✗")} ` : "";
+        return new Text(icon + theme.fg(context.isError ? "error" : "toolOutput", content), 0, 0);
       }
 
       if (details.mode === "single" && details.results.length === 1) {
@@ -1267,15 +1258,17 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "goals_list",
     label: "List Goals",
-    description: "List all active goals and their status.",
+    description: "List all active goals and their status. Model-visible output is capped at 48 KiB with explicit truncation notice.",
     parameters: Type.Object({
       all: Type.Optional(
         Type.Boolean({ description: "Include completed goals. Default: false." }),
       ),
-    }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params) {
       const showAll = params.all ?? false;
-      const filtered = showAll ? goals : goals.filter((g) => !g.completed);
+      const filtered = goals
+        .map((goal, index) => ({ goal, index }))
+        .filter(({ goal }) => showAll || !goal.completed);
 
       if (filtered.length === 0) {
         return {
@@ -1284,24 +1277,23 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const lines = filtered.map((g, i) => {
-        const icon = g.completed ? "✓" : "○";
-        const typeLabel = g.checkCommand ? ` [check: \`${g.checkCommand}\`]` : " [qualitative]";
-        const progress = g.progress ? `\n   Progress: ${g.progress}` : "";
-        return `${icon} ${i + 1}. ${g.description}${typeLabel}${progress}`;
+      const lines = filtered.map(({ goal, index }) => {
+        const icon = goal.completed ? "✓" : "○";
+        const progress = goal.progress ? `\n   Progress: ${goal.progress}` : "";
+        return `${icon} ${index + 1}. ${goal.description} [qualitative]${progress}`;
       });
 
-      const completed = goals.filter((g) => g.completed).length;
+      const completed = goals.filter((goal) => goal.completed).length;
       const total = goals.length;
 
       return {
         content: [
           {
             type: "text",
-            text: `Goals: ${completed}/${total} completed\n\n${lines.join("\n\n")}`,
+            text: capGoalToolOutput(`Goals: ${completed}/${total} completed\n\n${lines.join("\n\n")}`),
           },
         ],
-        details: { goals: filtered },
+        details: { goals: snapshotGoals(filtered.map(({ goal }) => goal)) },
       };
     },
     renderCall(_args, theme, _context) {
@@ -1317,46 +1309,36 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "goals_add",
     label: "Add Goal",
-    description: [
-      "Add a new goal for the agent team to work towards.",
-      "Goals can be programmatic (with a check command that exits 0 when met) or qualitative.",
-    ].join(" "),
-    promptSnippet: "Add a goal with optional check command",
+    description: "Add a bounded, data-only qualitative goal. Executable checks are not accepted, stored, or run.",
+    promptSnippet: "Add a qualitative goal",
     promptGuidelines: [
-      "Use goals_add to define long-horizon objectives for agent team workflows.",
-      "Programmatic goals should have a check command that exits 0 when the goal is met.",
-      "Qualitative goals should have clear, verifiable descriptions.",
+      "Use goals_add to define clear long-horizon objectives, then verify through the normal authorized tools and record the result with goals_update.",
+      "Never place shell commands or executable checks in goals_add; goals are data only.",
     ],
     parameters: Type.Object({
       description: Type.String({ description: "Goal description" }),
-      check_command: Type.Optional(
-        Type.String({
-          description:
-            "Bash command to check if goal is met (exit 0 = met). E.g., 'npm test', 'grep -q PASS ./results.txt'",
-        }),
-      ),
-    }),
+    }, { additionalProperties: false }),
+    prepareArguments: prepareGoalAddArguments,
     async execute(_toolCallId, params) {
+      const description = requireGoalDescription(params.description);
+      if (goals.length >= MAX_GOALS) {
+        throw new Error(`Goal limit reached (${MAX_GOALS}). Remove a goal before adding another.`);
+      }
+
       const goal: Goal = {
-        id: `goal-${nextGoalId++}`,
-        description: params.description,
-        checkCommand: params.check_command,
+        id: allocateGoalId(goals),
+        description,
         completed: false,
         createdAt: Date.now(),
       };
+      commitGoals([...goals, goal]);
 
-      goals.push(goal);
-      persistGoals();
-
-      const type = goal.checkCommand ? "programmatic" : "qualitative";
       return {
-        content: [
-          {
-            type: "text",
-            text: `Goal ${goals.length} added (${type}): ${goal.description}${goal.checkCommand ? `\nCheck: \`${goal.checkCommand}\`` : ""}`,
-          },
-        ],
-        details: { goal },
+        content: [{
+          type: "text",
+          text: capGoalToolOutput(`Goal ${goals.length} added (qualitative): ${goal.description}`),
+        }],
+        details: { goal: snapshotGoal(goal) },
       };
     },
     renderCall(args, theme, _context) {
@@ -1369,88 +1351,30 @@ export default function (pi: ExtensionAPI) {
         theme.fg("toolTitle", theme.bold("goals add ")) + theme.fg("dim", preview);
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme, _context) {
+    renderResult(result, _options, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      return new Text(theme.fg("success", "✓ ") + theme.fg("toolOutput", content), 0, 0);
+      const icon = context.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
+      return new Text(icon + theme.fg(context.isError ? "error" : "toolOutput", content), 0, 0);
     },
   });
 
   pi.registerTool({
     name: "goals_check",
     label: "Check Goals",
-    description: [
-      "Check all programmatic goals by running their check commands.",
-      "Goals whose check commands exit 0 are automatically marked complete.",
-      "Qualitative goals must be manually marked complete via goals_update.",
-    ].join(" "),
-    promptSnippet: "Check programmatic goals by running their check commands",
+    description: "Compatibility-only status report for qualitative goals. It never executes commands, probes, callbacks, or stored text. Model-visible output is capped at 48 KiB with explicit truncation notice.",
+    promptSnippet: "Report qualitative goal status without executing checks",
     promptGuidelines: [
-      "Use goals_check to verify programmatic goals after completing work.",
-      "Programmatic goals are auto-marked complete when their check command exits 0.",
-      "Qualitative goals require manual progress updates via goals_update.",
+      "goals_check is a non-executing compatibility tool; verify goals with the normal authorized tools, then record evidence using goals_update.",
     ],
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Check a specific goal by index (1-based). Omit to check all." })),
-    }),
+      id: Type.Optional(Type.String({ description: "Report a specific goal by index (1-based). Omit to report all." })),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params) {
-      const toCheck = params.id
-        ? (() => {
-            const idx = parseInt(params.id, 10) - 1;
-            if (isNaN(idx) || idx < 0 || idx >= goals.length) return [];
-            return [goals[idx]];
-          })()
-        : [...goals];
-
-      if (toCheck.length === 0) {
-        return {
-          content: [{ type: "text", text: "No goals to check." }],
-          details: {},
-        };
-      }
-
-      const results: string[] = [];
-      for (const goal of toCheck) {
-        if (goal.completed) {
-          results.push(`✓ ${goal.description} (already completed)`);
-          continue;
-        }
-        if (!goal.checkCommand) {
-          results.push(`○ ${goal.description} (qualitative - cannot auto-check)`);
-          continue;
-        }
-
-        try {
-          const result = await pi.exec("bash", ["-c", goal.checkCommand], {
-            timeout: 30000,
-          });
-
-          if (result.code === 0) {
-            goal.completed = true;
-            goal.completedAt = Date.now();
-            goal.progress = `Auto-checked: ${result.stdout?.trim() || "(check passed)"}`;
-            results.push(`✓ ${goal.description} - MET: ${result.stdout?.trim() || "(passed)"}`);
-          } else {
-            results.push(
-              `○ ${goal.description} - NOT MET (exit ${result.code}): ${result.stderr?.trim() || result.stdout?.trim() || "(no output)"}`,
-            );
-          }
-        } catch (err: any) {
-          results.push(`✗ ${goal.description} - CHECK ERROR: ${err.message}`);
-        }
-      }
-
-      persistGoals();
-
-      const met = toCheck.filter((g) => g.completed).length;
+      const report = buildGoalsCheckReport(goals, params.id);
       return {
-        content: [
-          {
-            type: "text",
-            text: `Checked ${toCheck.length} goal(s): ${met} met\n\n${results.join("\n")}`,
-          },
-        ],
-        details: { results, goals: toCheck },
+        content: [{ type: "text", text: capGoalToolOutput(report.text) }],
+        details: { goals: report.goals },
       };
     },
     renderCall(args, theme, _context) {
@@ -1459,10 +1383,11 @@ export default function (pi: ExtensionAPI) {
         (args.id ? " " + theme.fg("accent", `#${args.id}`) : "");
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme, _context) {
+    renderResult(result, _options, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      return new Text(theme.fg("toolOutput", content), 0, 0);
+      const icon = context.isError ? `${theme.fg("error", "✗")} ` : "";
+      return new Text(icon + theme.fg(context.isError ? "error" : "toolOutput", content), 0, 0);
     },
   });
 
@@ -1475,47 +1400,41 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     promptSnippet: "Update a goal's progress or mark it complete",
     parameters: Type.Object({
-      index: Type.Number({ description: "Goal index (1-based) to update" }),
+      index: Type.Integer({ minimum: 1, description: "Goal index (1-based) to update" }),
       progress: Type.Optional(Type.String({ description: "Progress note to set" })),
       completed: Type.Optional(
         Type.Boolean({ description: "Set to true to mark as complete, false to re-open" }),
       ),
-    }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params) {
-      const idx = params.index - 1;
-      if (idx < 0 || idx >= goals.length || !goals[idx]) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid goal index ${params.index}. Use goals_list to see available goals (${goals.length} total).`,
-            },
-          ],
-          details: {},
-        };
-      }
+      const idx = requireGoalIndex(params.index, goals.length);
+      if (params.progress !== undefined) requireGoalProgress(params.progress);
 
-      const goal = goals[idx];
+      const goal: Goal = { ...goals[idx] };
       if (params.completed !== undefined) {
         goal.completed = params.completed;
         if (params.completed) goal.completedAt = Date.now();
-        else goal.completedAt = undefined;
+        else delete goal.completedAt;
       }
       if (params.progress !== undefined) {
         goal.progress = params.progress;
       }
 
-      persistGoals();
+      const nextGoals = [...goals];
+      nextGoals[idx] = goal;
+      commitGoals(nextGoals);
 
       const status = goal.completed ? "✓ COMPLETED" : "○ IN PROGRESS";
       return {
         content: [
           {
             type: "text",
-            text: `Goal ${params.index} updated: ${goal.description}\nStatus: ${status}\nProgress: ${goal.progress || "(none)"}`,
+            text: capGoalToolOutput(
+              `Goal ${params.index} updated: ${goal.description}\nStatus: ${status}\nProgress: ${goal.progress || "(none)"}`,
+            ),
           },
         ],
-        details: { goal },
+        details: { goal: snapshotGoal(goal) },
       };
     },
     renderCall(args, theme, _context) {
@@ -1523,11 +1442,11 @@ export default function (pi: ExtensionAPI) {
         theme.fg("toolTitle", theme.bold("goals update ")) + theme.fg("accent", `#${args.index}`);
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme, _context) {
+    renderResult(result, _options, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-      return new Text(icon + " " + theme.fg("toolOutput", content), 0, 0);
+      const icon = context.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      return new Text(icon + " " + theme.fg(context.isError ? "error" : "toolOutput", content), 0, 0);
     },
   });
 
@@ -1536,33 +1455,21 @@ export default function (pi: ExtensionAPI) {
     label: "Remove Goal",
     description: "Remove a goal by index number.",
     parameters: Type.Object({
-      index: Type.Number({ description: "Goal index (1-based) to remove" }),
-    }),
+      index: Type.Integer({ minimum: 1, description: "Goal index (1-based) to remove" }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params) {
-      const idx = params.index - 1;
-      if (idx < 0 || idx >= goals.length || !goals[idx]) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid goal index ${params.index}. Use goals_list to see available goals (${goals.length} total).`,
-            },
-          ],
-          details: {},
-        };
-      }
-
-      const removed = goals.splice(idx, 1)[0];
-      persistGoals();
+      const idx = requireGoalIndex(params.index, goals.length);
+      const removed = goals[idx];
+      commitGoals([...goals.slice(0, idx), ...goals.slice(idx + 1)]);
 
       return {
         content: [
           {
             type: "text",
-            text: `Removed goal: ${removed.description}`,
+            text: capGoalToolOutput(`Removed goal: ${removed.description}`),
           },
         ],
-        details: { removed },
+        details: { removed: snapshotGoal(removed) },
       };
     },
     renderCall(args, theme, _context) {
@@ -1570,10 +1477,11 @@ export default function (pi: ExtensionAPI) {
         theme.fg("toolTitle", theme.bold("goals remove ")) + theme.fg("accent", `#${args.index}`);
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme, _context) {
+    renderResult(result, _options, theme, context) {
       const text = result.content?.[0];
       const content = text?.type === "text" ? text.text : "(no output)";
-      return new Text(theme.fg("toolOutput", content), 0, 0);
+      const icon = context.isError ? `${theme.fg("error", "✗")} ` : "";
+      return new Text(icon + theme.fg(context.isError ? "error" : "toolOutput", content), 0, 0);
     },
   });
 }

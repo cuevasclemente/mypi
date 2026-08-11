@@ -64,9 +64,9 @@ Main Pi Agent (Orchestrator)
 | Tool           | Description                                |
 |----------------|--------------------------------------------|
 | `goals_list`   | List active goals                          |
-| `goals_add`    | Add a goal (programmatic or qualitative)   |
-| `goals_check`  | Check programmatic goals by running checks |
-| `goals_update` | Update goal progress or mark complete      |
+| `goals_add`    | Add a bounded qualitative goal             |
+| `goals_check`  | Compatibility status report; executes nothing |
+| `goals_update` | Record verified progress or mark complete  |
 | `goals_remove` | Remove a goal                              |
 
 ## Commands
@@ -74,7 +74,7 @@ Main Pi Agent (Orchestrator)
 | Command              | Description                              |
 |----------------------|------------------------------------------|
 | `/goals`             | List active goals                        |
-| `/goals:add`         | Add a goal (`desc` or `desc \| check`)   |
+| `/goals:add`         | Add a qualitative goal; legacy `| check` text is discarded |
 | `/goals:done <n>`    | Mark goal #n complete                    |
 | `/subagents`         | List active subagents (tree view)        |
 
@@ -103,8 +103,10 @@ Active goals (created with `goals_add`) are automatically injected into subagent
 
 1. Define goals before spawning subagents
 2. Poll subagents and check responses for progress indicators
-3. Run `goals_check` after subagents complete to verify programmatic goals
-4. Use `goals_update` to record progress on qualitative goals
+3. Verify results through the orchestrator's normal authorized tool surface
+4. Use `goals_update` to record the evidence and completion state
+
+Goals never store or execute shell/process checks. `goals_check` is retained only so older calls fail safely into a read-only status report.
 
 ### Model Inheritance
 
@@ -120,9 +122,11 @@ Model overrides use the same format as pi's `--model` flag: `provider/model-id` 
 
 Subagents can be restricted to specific tools via the `tools` parameter. This is a comma-separated list of tool names:
 
-- `"read, bash"` — read-only access
-- `"read, bash, edit, write, grep, find, ls"` — full coding access
-- Omit to inherit the parent's current active tool set (never a broader Pi default)
+- `"read, grep, find, ls"` — guarded read/search access
+- `"read, edit, write, grep, find, ls"` — all reviewed guarded path tools
+- Omit to inherit only the safe intersection of the parent's active tools
+
+Bash, `sudo_exec`, goals tools, and custom tools are always removed from children.
 
 ## Designing an Identity
 
@@ -213,4 +217,4 @@ plugins/agent-teams/
 
 ## Nesting
 
-Subagents can spawn their own children. The orchestrator (your main pi session) is the root of every tree. When a parent stops, its children stop too. For a subagent to spawn its own children, the extension must be available in its subprocess (configured separately).
+The manager retains tree/cascading-stop support for trusted parent-owned records, but companion-policy children do not receive Agent Teams tools and cannot spawn descendants. The orchestrator (the main Pi session) remains the only model-callable spawn authority.
