@@ -59,6 +59,21 @@ interface TodoDetails {
   message?: string;
 }
 
+interface TodoPreseedItem {
+  text?: unknown;
+  status?: unknown;
+  priority?: unknown;
+  dependencies?: unknown;
+  assignee?: unknown;
+  notes?: unknown;
+}
+
+interface TodoPreseedDetails {
+  hook?: unknown;
+  trigger?: unknown;
+  todos?: unknown;
+}
+
 // ── Constants ───────────────────────────────────────────────────────────────────
 
 const STATUS_ORDER: Record<TodoStatus, number> = {
@@ -98,6 +113,22 @@ const PRIORITY_COLORS: Record<TodoPriority, string> = {
   medium: "accent",
   low: "muted",
 };
+
+function isTodoStatus(value: unknown): value is TodoStatus {
+  return typeof value === "string" && value in STATUS_ORDER;
+}
+
+function isTodoPriority(value: unknown): value is TodoPriority {
+  return typeof value === "string" && value in PRIORITY_ORDER;
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function numberArrayOrEmpty(value: unknown): number[] {
+  return Array.isArray(value) ? value.filter((v): v is number => typeof v === "number") : [];
+}
 
 // ── Sorting ─────────────────────────────────────────────────────────────────────
 
@@ -144,6 +175,60 @@ function reconstructState(ctx: ExtensionContext): void {
 function applyChanges(action: string, message?: string): TodoDetails {
   todos = sortTodos(todos);
   return { action, todos: todos.map((t) => ({ ...t })), nextId, message };
+}
+
+function finishTodoAction(action: string, message: string | undefined, ctx?: ExtensionContext): TodoDetails {
+  const details = applyChanges(action, message);
+  if (ctx) updateWidget(ctx);
+  return details;
+}
+
+function persistTodoState(pi: ExtensionAPI): void {
+  pi.appendEntry("todo-state", {
+    todos: todos.map((t) => ({ ...t })),
+    nextId,
+  });
+}
+
+function applyPreseedEntries(ctx: ExtensionContext): number {
+  let added = 0;
+
+  for (const entry of ctx.sessionManager.getEntries()) {
+    if (entry.type !== "custom" || entry.customType !== "todo-preseed") continue;
+    const data = entry.data as TodoPreseedDetails | undefined;
+    if (!data || !Array.isArray(data.todos)) continue;
+
+    const source = stringOrUndefined(data.hook) ?? "hook";
+
+    for (const raw of data.todos as TodoPreseedItem[]) {
+      const text = stringOrUndefined(raw?.text);
+      if (!text) continue;
+
+      // Preseed TODOs are session rituals. If the user already completed,
+      // cancelled, or edited the same checklist item in this session, do not
+      // recreate it on reload/resume.
+      if (todos.some((todo) => todo.text === text)) continue;
+
+      const now = Date.now() + added;
+      const todo: Todo = {
+        id: nextId++,
+        text,
+        status: isTodoStatus(raw.status) ? raw.status : "pending",
+        priority: isTodoPriority(raw.priority) ? raw.priority : "medium",
+        dependencies: numberArrayOrEmpty(raw.dependencies),
+        assignee: stringOrUndefined(raw.assignee) ?? source,
+        notes: stringOrUndefined(raw.notes),
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      todos.push(todo);
+      added++;
+    }
+  }
+
+  if (added > 0) todos = sortTodos(todos);
+  return added;
 }
 
 // ── Widget ──────────────────────────────────────────────────────────────────────
@@ -212,21 +297,29 @@ function updateWidget(ctx: ExtensionContext): void {
     const visible = sortTodos(active).slice(0, maxWidgetItems);
     const more = active.length - visible.length;
 
-    const lines: string[] = [];
-    lines.push(theme.fg("borderMuted", "───") + theme.fg("accent", " TODO ") + theme.fg("borderMuted", "─".repeat(20)));
-
-    for (const todo of visible) {
-      lines.push(renderWidgetLine(todo, theme, 80));
-    }
-
-    if (more > 0) {
-      lines.push(theme.fg("dim", `  ... and ${more} more (use /todos to see all)`));
-    }
-
-    lines.push(theme.fg("muted", "  /todos · /todos-reevaluate · /todos-full"));
-
     return {
-      render: () => lines,
+      render: (width: number) => {
+        if (width <= 0) return [];
+
+        const lines: string[] = [];
+        lines.push(
+          truncateToWidth(
+            theme.fg("borderMuted", "───") + theme.fg("accent", " TODO ") + theme.fg("borderMuted", "─".repeat(width)),
+            width,
+          ),
+        );
+
+        for (const todo of visible) {
+          lines.push(renderWidgetLine(todo, theme, width));
+        }
+
+        if (more > 0) {
+          lines.push(truncateToWidth(theme.fg("dim", `  ... and ${more} more (use /todos to see all)`), width));
+        }
+
+        lines.push(truncateToWidth(theme.fg("muted", "  /todos · /todos-reevaluate · /todos-full"), width));
+        return lines;
+      },
       invalidate: () => {},
     };
   });
@@ -651,11 +744,18 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    if (applyPreseedEntries(ctx) > 0) {
+      persistTodoState(pi);
+    }
+
     updateWidget(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     reconstructState(ctx);
+    if (applyPreseedEntries(ctx) > 0) {
+      persistTodoState(pi);
+    }
     updateWidget(ctx);
   });
 
@@ -664,15 +764,20 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", () => {
     // Append a custom entry so state survives restarts independently
     // of tool results alone
-    pi.appendEntry("todo-state", {
-      todos: todos.map((t) => ({ ...t })),
-      nextId,
-    });
+    persistTodoState(pi);
   });
 
   // ── System prompt injection ───────────────────────────────────────────────
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    // Hooks can preseed TODOs during session_start. Re-apply here too so the
+    // prompt is correct even if extension load order caused todo's
+    // session_start handler to run before hooks appended todo-preseed entries.
+    if (applyPreseedEntries(ctx) > 0) {
+      persistTodoState(pi);
+      updateWidget(ctx);
+    }
+
     const todoSummary = formatTodosForPrompt();
     const base = event.systemPrompt ?? "";
     return {
@@ -713,7 +818,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
     ],
     parameters: TodoParams,
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       switch (params.action) {
         case "list": {
           let filtered = [...todos];
@@ -736,7 +841,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
                     : `## TODO List (${filtered.length} items)\n\n${md}\n\n---\nUse \`todo add\` to create tasks, \`todo update\` to modify, \`todo toggle\` to mark done/undone.`,
               },
             ],
-            details: applyChanges("list"),
+            details: finishTodoAction("list", undefined, ctx),
           };
         }
 
@@ -756,7 +861,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
           const newTodo: Todo = {
             id: nextId++,
             text: params.text,
-            status: params.newStatus ?? "pending",
+            status: params.newStatus ?? params.status ?? "pending",
             priority: params.priority ?? "medium",
             dependencies: params.dependencies ?? [],
             assignee: params.assignee,
@@ -773,7 +878,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
                 text: `✓ Added #${newTodo.id}: ${newTodo.text} [${newTodo.status}] priority=${newTodo.priority}${newTodo.assignee ? ` @${newTodo.assignee}` : ""}`,
               },
             ],
-            details: applyChanges("add", `Added #${newTodo.id}`),
+            details: finishTodoAction("add", `Added #${newTodo.id}`, ctx),
           };
         }
 
@@ -800,9 +905,10 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
             todo.text = params.newText;
             changes.push("text");
           }
-          if (params.newStatus !== undefined) {
-            todo.status = params.newStatus;
-            changes.push(`status→${params.newStatus}`);
+          const statusUpdate = params.newStatus ?? params.status;
+          if (statusUpdate !== undefined) {
+            todo.status = statusUpdate;
+            changes.push(`status→${statusUpdate}`);
           }
           if (params.newPriority !== undefined) {
             todo.priority = params.newPriority;
@@ -830,7 +936,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
                 text: `✓ Updated #${todo.id}: ${todo.text}\nChanges: ${changes.join(", ") || "(none)"}`,
               },
             ],
-            details: applyChanges("update", `Updated #${todo.id}`),
+            details: finishTodoAction("update", `Updated #${todo.id}`, ctx),
           };
         }
 
@@ -868,7 +974,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
                 text: `✓ Todo #${todo.id} marked as ${todo.status}: ${todo.text}`,
               },
             ],
-            details: applyChanges("toggle", `Toggled #${todo.id}`),
+            details: finishTodoAction("toggle", `Toggled #${todo.id}`, ctx),
           };
         }
 
@@ -884,7 +990,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
                 text: removed === 0 ? "No completed todos to clear." : `✓ Cleared ${removed} completed/cancelled todos.`,
               },
             ],
-            details: applyChanges("clear_done", removed > 0 ? `Cleared ${removed}` : undefined),
+            details: finishTodoAction("clear_done", removed > 0 ? `Cleared ${removed}` : undefined, ctx),
           };
         }
 
@@ -924,7 +1030,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
 
           return {
             content: [{ type: "text", text: `✓ Reordered ${params.order.length} todos.` }],
-            details: applyChanges("reorder", "Reordered"),
+            details: finishTodoAction("reorder", "Reordered", ctx),
           };
         }
 
@@ -1015,7 +1121,7 @@ Use the \`todo\` tool to manage this list. Keep it updated as you work through t
                 text: `Batch complete (${params.items.length} operations):\n${results.join("\n")}`,
               },
             ],
-            details: applyChanges("batch", `${params.items.length} operations`),
+            details: finishTodoAction("batch", `${params.items.length} operations`, ctx),
           };
         }
 
