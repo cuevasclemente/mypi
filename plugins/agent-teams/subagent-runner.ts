@@ -18,6 +18,23 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import {
+  BoundedByteAccumulator,
+  PRIVILEGED_EXEC_PROTOCOL_VERSION,
+  PRIVILEGED_EXEC_RESULT_MESSAGE,
+  isPrivilegedExecCancelMessage,
+  isPrivilegedExecRequestMessage,
+  isPrivilegedExecResult,
+  type PrivilegedExecOrigin,
+  type PrivilegedExecRequest,
+  type PrivilegedExecResult,
+} from "./privileged-exec-protocol.js";
+import {
+  authorizeSubagentLaunch,
+  sanitizedChildProcessEnvironment,
+  validateChildPolicyGuardPath,
+  type SubagentLaunchAuthorization,
+} from "./companion-policy.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -46,6 +63,13 @@ export interface IdentitySpec {
   model?: string;
 }
 
+export interface SubagentExecutionPolicy {
+  parentCwd: string;
+  parentTools: string[];
+  parentSessionId?: string;
+  parentSessionFile?: string;
+}
+
 export interface SubagentResult {
   agent: string;
   task: string;
@@ -65,6 +89,18 @@ export interface SubagentDetails {
 }
 
 export type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
+
+/**
+ * Parent-owned privileged execution entrypoint for one-shot children.
+ *
+ * The runner constructs `origin` from its trusted call-site arguments. Child
+ * IPC is deliberately unable to supply or override identity or lineage.
+ */
+export type OneShotPrivilegedExecHandler = (
+  request: PrivilegedExecRequest,
+  origin: PrivilegedExecOrigin,
+  signal: AbortSignal,
+) => Promise<PrivilegedExecResult>;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -131,10 +167,27 @@ export function getDisplayItems(messages: Message[]): DisplayItem[] {
 
 // ── Pi invocation ───────────────────────────────────────────────────────────
 
+function isPiEntrypointScript(scriptPath: string | undefined): boolean {
+  if (!scriptPath) return false;
+  const basename = path.basename(scriptPath).toLowerCase();
+  if (/^pi(\.cmd|\.exe)?$/.test(basename)) return true;
+
+  const normalized = scriptPath.split(path.sep).join("/");
+  return (
+    normalized.includes("/@earendil-works/pi-coding-agent/") ||
+    normalized.includes("/pi-coding-agent/")
+  );
+}
+
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1];
   const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+  if (
+    currentScript &&
+    !isBunVirtualScript &&
+    fs.existsSync(currentScript) &&
+    isPiEntrypointScript(currentScript)
+  ) {
     return { command: process.execPath, args: [currentScript, ...args] };
   }
 
@@ -186,6 +239,21 @@ async function writePromptToTempFile(
   return { dir: tmpDir, filePath };
 }
 
+// ── One-shot privileged IPC ───────────────────────────────────────────────
+
+function privilegedExecError(error: string): PrivilegedExecResult {
+  return {
+    ok: false,
+    exitCode: null,
+    signal: null,
+    stdoutBase64: "",
+    stderrBase64: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    error,
+  };
+}
+
 // ── Single agent execution ────────────────────────────────────────────────
 
 export async function runSingleAgent(
@@ -197,6 +265,9 @@ export async function runSingleAgent(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SubagentResult[]) => SubagentDetails,
+  privilegedExecHandler?: OneShotPrivilegedExecHandler,
+  trustedParentLineage: readonly string[] = [],
+  executionPolicy?: SubagentExecutionPolicy,
 ): Promise<SubagentResult> {
   const trimmedPrompt = identity.systemPrompt?.trim() ?? "";
   if (!trimmedPrompt) {
@@ -211,9 +282,40 @@ export async function runSingleAgent(
     };
   }
 
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (identity.model) args.push("--model", identity.model);
-  if (identity.tools && identity.tools.length > 0) args.push("--tools", identity.tools.join(","));
+  if (!executionPolicy) {
+    return {
+      agent: identity.name,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: "Companion policy context is unavailable; subagent launch denied.",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+      step,
+    };
+  }
+  const targetCwd = cwd ?? defaultCwd;
+  const authorize = (): SubagentLaunchAuthorization => authorizeSubagentLaunch({
+    parentCwd: executionPolicy.parentCwd,
+    targetCwd,
+    parentTools: executionPolicy.parentTools,
+    requestedTools: identity.tools,
+    parentSessionId: executionPolicy.parentSessionId,
+    parentSessionFile: executionPolicy.parentSessionFile,
+  });
+  let launchAuthorization: SubagentLaunchAuthorization;
+  try {
+    launchAuthorization = authorize();
+  } catch (error) {
+    return {
+      agent: identity.name,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: error instanceof Error ? error.message : "Companion policy denied subagent launch.",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+      step,
+    };
+  }
 
   let tmpPromptDir: string | null = null;
   let tmpPromptPath: string | null = null;
@@ -244,19 +346,105 @@ export async function runSingleAgent(
     const tmp = await writePromptToTempFile(identity.name, trimmedPrompt);
     tmpPromptDir = tmp.dir;
     tmpPromptPath = tmp.filePath;
-    args.push("--append-system-prompt", tmpPromptPath);
-
-    args.push(`Task: ${task}`);
     let wasAborted = false;
 
     const exitCode = await new Promise<number>((resolve) => {
+      // Final fail-closed check and option derivation at the process-creation
+      // boundary. A newly protected project must remove risky tools before
+      // argv is built, not merely update the propagated environment.
+      const guardPath = validateChildPolicyGuardPath();
+      launchAuthorization = authorize();
+      const args: string[] = [
+        "--mode", "json", "-p", "--no-session", "--no-extensions", "--extension", guardPath,
+      ];
+      if (identity.model) args.push("--model", identity.model);
+      if (launchAuthorization.effectiveTools.length > 0) {
+        args.push("--tools", launchAuthorization.effectiveTools.join(","));
+      } else {
+        args.push("--no-tools");
+      }
+      args.push("--append-system-prompt", tmpPromptPath!);
+      args.push(`Task: ${task}`);
       const invocation = getPiInvocation(args);
       const proc = spawn(invocation.command, invocation.args, {
-        cwd: cwd ?? defaultCwd,
+        cwd: targetCwd,
         shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
+        env: sanitizedChildProcessEnvironment(launchAuthorization),
+        // fd 3 is a dedicated Node IPC channel. stdin remains intentionally
+        // ignored: privileged requests never share JSON/stdin transport.
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
       });
       let buffer = "";
+      const boundedStderr = new BoundedByteAccumulator();
+      const privilegedRequests = new Map<string, AbortController>();
+      const seenPrivilegedRequestIds = new Set<string>();
+      const origin: PrivilegedExecOrigin = {
+        mode: "one-shot",
+        lineage: [...trustedParentLineage, identity.name],
+      };
+
+      const sendPrivilegedResult = (requestId: string, result: PrivilegedExecResult) => {
+        if (typeof proc.send !== "function" || !proc.connected) return;
+        proc.send({
+          type: PRIVILEGED_EXEC_RESULT_MESSAGE,
+          version: PRIVILEGED_EXEC_PROTOCOL_VERSION,
+          requestId,
+          result,
+        }, () => { /* child exit/disconnect races are expected */ });
+      };
+
+      const abortPrivilegedRequests = () => {
+        for (const controller of privilegedRequests.values()) controller.abort();
+        privilegedRequests.clear();
+      };
+
+      proc.on("message", (message: unknown) => {
+        if (isPrivilegedExecCancelMessage(message)) {
+          const controller = privilegedRequests.get(message.requestId);
+          if (controller) {
+            privilegedRequests.delete(message.requestId);
+            controller.abort();
+            sendPrivilegedResult(message.requestId, privilegedExecError("privileged request cancelled"));
+          }
+          return;
+        }
+        // Exact protocol validation rejects child-asserted origin, lineage,
+        // session, or identity fields as well as malformed requests.
+        if (!isPrivilegedExecRequestMessage(message)) return;
+        if (seenPrivilegedRequestIds.has(message.requestId)) {
+          sendPrivilegedResult(message.requestId, privilegedExecError("duplicate privileged request id"));
+          return;
+        }
+        seenPrivilegedRequestIds.add(message.requestId);
+        let liveAuthorization: SubagentLaunchAuthorization;
+        try {
+          liveAuthorization = authorize();
+        } catch {
+          sendPrivilegedResult(message.requestId, privilegedExecError("companion policy denied privileged execution"));
+          return;
+        }
+        if (!liveAuthorization.allowPrivilegedExec) {
+          sendPrivilegedResult(message.requestId, privilegedExecError("sudo_exec is outside the propagated child tool policy"));
+          return;
+        }
+        if (!privilegedExecHandler) {
+          sendPrivilegedResult(message.requestId, privilegedExecError("parent privileged request handler is unavailable"));
+          return;
+        }
+
+        const controller = new AbortController();
+        privilegedRequests.set(message.requestId, controller);
+        void privilegedExecHandler(message.request, origin, controller.signal)
+          .then((result) => isPrivilegedExecResult(result)
+            ? result
+            : privilegedExecError("parent privileged request handler returned an invalid result"))
+          .catch(() => privilegedExecError("parent privileged request handler failed"))
+          .then((result) => {
+            if (privilegedRequests.get(message.requestId) !== controller) return;
+            privilegedRequests.delete(message.requestId);
+            sendPrivilegedResult(message.requestId, result);
+          });
+      });
 
       const processLine = (line: string) => {
         if (!line.trim()) return;
@@ -302,26 +490,31 @@ export async function runSingleAgent(
         for (const line of lines) processLine(line);
       });
 
-      proc.stderr.on("data", (data) => {
-        currentResult.stderr += data.toString();
+      proc.stderr.on("data", (data: Buffer) => {
+        boundedStderr.append(data);
+        currentResult.stderr = boundedStderr.toBuffer().toString("utf8");
       });
 
       proc.on("close", (code) => {
+        abortPrivilegedRequests();
         if (buffer.trim()) processLine(buffer);
         resolve(code ?? 0);
       });
 
       proc.on("error", () => {
+        abortPrivilegedRequests();
         resolve(1);
       });
+      proc.on("disconnect", abortPrivilegedRequests);
 
       if (signal) {
         const killProc = () => {
           wasAborted = true;
+          abortPrivilegedRequests();
           proc.kill("SIGTERM");
           setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-          }, 5000);
+            if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+          }, 5000).unref();
         };
         if (signal.aborted) killProc();
         else signal.addEventListener("abort", killProc, { once: true });
@@ -361,6 +554,9 @@ export async function runParallelAgents(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SubagentResult[]) => SubagentDetails,
+  privilegedExecHandler?: OneShotPrivilegedExecHandler,
+  trustedParentLineage: readonly string[] = [],
+  executionPolicy?: SubagentExecutionPolicy,
 ): Promise<SubagentResult[]> {
   const allResults: SubagentResult[] = new Array(tasks.length);
 
@@ -406,6 +602,9 @@ export async function runParallelAgents(
         }
       },
       makeDetails,
+      privilegedExecHandler,
+      trustedParentLineage,
+      executionPolicy,
     );
     allResults[index] = result;
     emitParallelUpdate();
@@ -429,6 +628,9 @@ export async function runChainAgents(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SubagentResult[]) => SubagentDetails,
+  privilegedExecHandler?: OneShotPrivilegedExecHandler,
+  trustedParentLineage: readonly string[] = [],
+  executionPolicy?: SubagentExecutionPolicy,
 ): Promise<SubagentResult[]> {
   const results: SubagentResult[] = [];
   let previousOutput = "";
@@ -459,6 +661,9 @@ export async function runChainAgents(
       signal,
       chainUpdate,
       makeDetails,
+      privilegedExecHandler,
+      trustedParentLineage,
+      executionPolicy,
     );
     results.push(result);
 

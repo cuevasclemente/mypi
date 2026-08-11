@@ -13,6 +13,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import {
+  PRIVILEGED_EXEC_PROTOCOL_VERSION,
+  PRIVILEGED_EXEC_RESULT_MESSAGE,
+  type PrivilegedExecOrigin,
+  type PrivilegedExecRequest,
+  type PrivilegedExecResult,
+  isPrivilegedExecCancelMessage,
+  isPrivilegedExecRequestMessage,
+  isPrivilegedExecResult,
+} from "./privileged-exec-protocol.js";
+import {
+  authorizeSubagentLaunch,
+  sanitizedChildProcessEnvironment,
+  validateChildPolicyGuardPath,
+  type SubagentLaunchAuthorization,
+} from "./companion-policy.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -31,6 +47,13 @@ export interface SubagentSpec {
   model?: string;
   /** Working directory */
   cwd?: string;
+  /** Trusted parent cwd used for live companion-policy checks. */
+  policyParentCwd: string;
+  /** Parent's active tool ceiling; children may only narrow it. */
+  policyParentTools: string[];
+  /** Current parent Pi identity used to derive the source agent profile. */
+  policyParentSessionId?: string;
+  policyParentSessionFile?: string;
 }
 
 export interface SubagentMessage {
@@ -63,12 +86,17 @@ export interface SubagentSummary {
 
 // ── Internal state ──────────────────────────────────────────────────────────
 
+interface PendingPrivilegedRequest {
+  controller: AbortController;
+}
+
 interface AgentState {
   spec: SubagentSpec;
   process: ChildProcess;
   status: SubagentStatus["status"];
   messages: SubagentMessage[];
   pendingResolve?: (msg: SubagentMessage | null) => void;
+  pendingPrivileged: Map<string, PendingPrivilegedRequest>;
   buffer: string;
   tmpDir: string | null;
   tmpSpecPath: string | null;
@@ -90,10 +118,29 @@ function writeRpc(stdin: NodeJS.WritableStream | null, request: RpcRequest): voi
 // ── Subagent Manager ────────────────────────────────────────────────────────
 
 export type SubagentNotifyHandler = (agentId: string, content: string) => void;
+export type SubagentPrivilegedExecHandler = (
+  request: PrivilegedExecRequest,
+  origin: PrivilegedExecOrigin,
+  signal: AbortSignal,
+) => Promise<PrivilegedExecResult>;
+
+function privilegedErrorResult(error: string): PrivilegedExecResult {
+  return {
+    ok: false,
+    exitCode: null,
+    signal: null,
+    stdoutBase64: "",
+    stderrBase64: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    error,
+  };
+}
 
 export class SubagentManager {
   private agents = new Map<string, AgentState>();
   private notifyHandler?: SubagentNotifyHandler;
+  private privilegedExecHandler?: SubagentPrivilegedExecHandler;
 
   /**
    * Set the handler called when a subagent's unsupervised turn finishes.
@@ -104,6 +151,15 @@ export class SubagentManager {
    */
   setNotifyHandler(handler: SubagentNotifyHandler | undefined): void {
     this.notifyHandler = handler;
+  }
+
+  /**
+   * Install the trusted parent-side privileged execution handler. Child
+   * processes supply only a validated request; identity and lineage are
+   * always derived from this manager's own SubagentSpec records.
+   */
+  setPrivilegedExecHandler(handler: SubagentPrivilegedExecHandler | undefined): void {
+    this.privilegedExecHandler = handler;
   }
 
   // ── Tree helpers ───────────────────────────────────────────────────────
@@ -127,6 +183,21 @@ export class SubagentManager {
       result.push(...this.getDescendants(childId));
     }
     return result;
+  }
+
+  /** Build trusted root-to-requester lineage solely from manager-owned specs. */
+  private getLineage(agentId: string): string[] {
+    const lineage: string[] = [];
+    const visited = new Set<string>();
+    let currentId: string | undefined = agentId;
+    while (currentId && !visited.has(currentId)) {
+      const state = this.agents.get(currentId);
+      if (!state) break;
+      visited.add(currentId);
+      lineage.push(state.spec.id);
+      currentId = state.spec.parentId;
+    }
+    return lineage.reverse();
   }
 
   /** Build a tree representation for listing */
@@ -167,9 +238,16 @@ export class SubagentManager {
       throw new Error(`Subagent "${spec.id}" already exists`);
     }
 
-    const args: string[] = ["--mode", "rpc", "--no-session"];
-    if (spec.model) args.push("--model", spec.model);
-    if (spec.tools) args.push("--tools", spec.tools);
+    const targetCwd = spec.cwd ?? process.cwd();
+    const authorize = (): SubagentLaunchAuthorization => authorizeSubagentLaunch({
+      parentCwd: spec.policyParentCwd,
+      targetCwd,
+      parentTools: spec.policyParentTools,
+      requestedTools: spec.tools,
+      parentSessionId: spec.policyParentSessionId,
+      parentSessionFile: spec.policyParentSessionFile,
+    });
+    let authorization = authorize();
 
     // Write system prompt to temp file
     const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-team-agent-"));
@@ -182,24 +260,45 @@ export class SubagentManager {
       });
     });
 
+    // Re-read the projection immediately before process creation. A policy
+    // change between frontend acceptance and spawn must deny, never inherit a
+    // stale allow decision. Clean the private prompt if that final check denies.
+    let guardPath: string;
+    try {
+      guardPath = validateChildPolicyGuardPath();
+      authorization = authorize();
+    } catch (error) {
+      try { fs.unlinkSync(tmpSpecPath); } catch { /* best effort */ }
+      try { fs.rmdirSync(tmpDir); } catch { /* best effort */ }
+      throw error;
+    }
+    const args: string[] = [
+      "--mode", "rpc", "--no-session", "--no-extensions", "--extension", guardPath,
+    ];
+    if (spec.model) args.push("--model", spec.model);
+    if (authorization.effectiveTools.length > 0) {
+      args.push("--tools", authorization.effectiveTools.join(","));
+    } else {
+      args.push("--no-tools");
+    }
     args.push("--append-system-prompt", tmpSpecPath);
-
-    const cwd = spec.cwd ?? process.cwd();
     const invocation = getPiInvocation(args);
     const proc = spawn(invocation.command, invocation.args, {
-      cwd,
+      cwd: targetCwd,
       shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
+      env: sanitizedChildProcessEnvironment(authorization),
+      stdio: ["pipe", "pipe", "pipe", "ipc"],
     });
 
     const messages: SubagentMessage[] = [];
 
     const agentState: AgentState = {
-      spec: { ...spec },
+      spec: { ...spec, cwd: targetCwd, tools: authorization.effectiveTools.join(",") },
       process: proc,
       status: "idle",
       messages,
       pendingResolve: undefined,
+      pendingPrivileged: new Map(),
       buffer: "",
       tmpDir,
       tmpSpecPath,
@@ -237,7 +336,16 @@ export class SubagentManager {
       }
     });
 
+    proc.on("message", (message: unknown) => {
+      this.handlePrivilegedIpcMessage(spec.id, message);
+    });
+
+    proc.on("disconnect", () => {
+      this.abortPrivilegedRequests(agentState, "privileged IPC channel closed", false);
+    });
+
     proc.on("close", (code) => {
+      this.abortPrivilegedRequests(agentState, "subagent process closed", false);
       if (agentState.status !== "stopped") {
         agentState.status = code === 0 ? "idle" : "error";
       }
@@ -248,6 +356,7 @@ export class SubagentManager {
     });
 
     proc.on("error", (err) => {
+      this.abortPrivilegedRequests(agentState, "subagent process error", false);
       agentState.status = "error";
       agentState.messages.push({
         role: "toolResult",
@@ -261,6 +370,127 @@ export class SubagentManager {
     });
 
     return this.getStatus(spec.id);
+  }
+
+  /** Accept only exact protocol request/cancel messages from a child. */
+  private handlePrivilegedIpcMessage(agentId: string, message: unknown): void {
+    const state = this.agents.get(agentId);
+    if (!state) return;
+
+    if (isPrivilegedExecCancelMessage(message)) {
+      const pending = state.pendingPrivileged.get(message.requestId);
+      if (!pending) return;
+      pending.controller.abort();
+      this.settlePrivilegedRequest(
+        state,
+        message.requestId,
+        privilegedErrorResult("privileged request cancelled"),
+      );
+      return;
+    }
+
+    if (!isPrivilegedExecRequestMessage(message)) return;
+    const duplicate = state.pendingPrivileged.get(message.requestId);
+    if (duplicate) {
+      duplicate.controller.abort();
+      this.settlePrivilegedRequest(
+        state,
+        message.requestId,
+        privilegedErrorResult("duplicate privileged request ID"),
+      );
+      return;
+    }
+
+    let authorization: SubagentLaunchAuthorization;
+    try {
+      authorization = authorizeSubagentLaunch({
+        parentCwd: state.spec.policyParentCwd,
+        targetCwd: state.spec.cwd ?? process.cwd(),
+        parentTools: state.spec.policyParentTools,
+        requestedTools: state.spec.tools,
+        parentSessionId: state.spec.policyParentSessionId,
+        parentSessionFile: state.spec.policyParentSessionFile,
+      });
+    } catch {
+      this.sendPrivilegedResult(
+        state,
+        message.requestId,
+        privilegedErrorResult("companion policy denied privileged execution"),
+      );
+      return;
+    }
+    if (!authorization.allowPrivilegedExec) {
+      this.sendPrivilegedResult(
+        state,
+        message.requestId,
+        privilegedErrorResult("sudo_exec is outside the propagated child tool policy"),
+      );
+      return;
+    }
+
+    const controller = new AbortController();
+    state.pendingPrivileged.set(message.requestId, { controller });
+    const handler = this.privilegedExecHandler;
+    if (!handler) {
+      this.settlePrivilegedRequest(
+        state,
+        message.requestId,
+        privilegedErrorResult("parent privileged broker is unavailable"),
+      );
+      return;
+    }
+
+    const origin: PrivilegedExecOrigin = {
+      mode: "long-lived",
+      lineage: this.getLineage(agentId),
+    };
+    void Promise.resolve()
+      .then(() => handler(message.request, origin, controller.signal))
+      .then((result) => {
+        this.settlePrivilegedRequest(
+          state,
+          message.requestId,
+          isPrivilegedExecResult(result)
+            ? result
+            : privilegedErrorResult("parent privileged broker returned an invalid result"),
+        );
+      }, () => {
+        this.settlePrivilegedRequest(
+          state,
+          message.requestId,
+          privilegedErrorResult("parent privileged broker failed"),
+        );
+      });
+  }
+
+  private sendPrivilegedResult(state: AgentState, requestId: string, result: PrivilegedExecResult): void {
+    if (!state.process.connected || typeof state.process.send !== "function") return;
+    try {
+      state.process.send({
+        type: PRIVILEGED_EXEC_RESULT_MESSAGE,
+        version: PRIVILEGED_EXEC_PROTOCOL_VERSION,
+        requestId,
+        result,
+      }, () => { /* IPC send failures are settled locally and contain no request data. */ });
+    } catch {
+      // The child may disconnect between the connected check and send.
+    }
+  }
+
+  private settlePrivilegedRequest(state: AgentState, requestId: string, result: PrivilegedExecResult): void {
+    if (!state.pendingPrivileged.delete(requestId)) return;
+    this.sendPrivilegedResult(state, requestId, result);
+  }
+
+  private abortPrivilegedRequests(state: AgentState, reason: string, sendResult: boolean): void {
+    for (const [requestId, pending] of [...state.pendingPrivileged]) {
+      pending.controller.abort();
+      if (sendResult) {
+        this.settlePrivilegedRequest(state, requestId, privilegedErrorResult(reason));
+      } else {
+        state.pendingPrivileged.delete(requestId);
+      }
+    }
   }
 
   /** Handle an event from an RPC subprocess */
@@ -334,6 +564,14 @@ export class SubagentManager {
   async send(agentId: string, text: string): Promise<SubagentMessage | null> {
     const state = this.agents.get(agentId);
     if (!state) throw new Error(`Subagent "${agentId}" not found`);
+    authorizeSubagentLaunch({
+      parentCwd: state.spec.policyParentCwd,
+      targetCwd: state.spec.cwd ?? process.cwd(),
+      parentTools: state.spec.policyParentTools,
+      requestedTools: state.spec.tools,
+      parentSessionId: state.spec.policyParentSessionId,
+      parentSessionFile: state.spec.policyParentSessionFile,
+    });
     if (state.status === "stopped" || state.status === "error") {
       throw new Error(`Subagent "${agentId}" is ${state.status}`);
     }
@@ -360,6 +598,14 @@ export class SubagentManager {
   async sendAsync(agentId: string, text: string): Promise<void> {
     const state = this.agents.get(agentId);
     if (!state) throw new Error(`Subagent "${agentId}" not found`);
+    authorizeSubagentLaunch({
+      parentCwd: state.spec.policyParentCwd,
+      targetCwd: state.spec.cwd ?? process.cwd(),
+      parentTools: state.spec.policyParentTools,
+      requestedTools: state.spec.tools,
+      parentSessionId: state.spec.policyParentSessionId,
+      parentSessionFile: state.spec.policyParentSessionFile,
+    });
     if (state.status === "stopped" || state.status === "error") {
       throw new Error(`Subagent "${agentId}" is ${state.status}`);
     }
@@ -468,6 +714,7 @@ export class SubagentManager {
     }
 
     state.status = "stopped";
+    this.abortPrivilegedRequests(state, "subagent stopped", true);
 
     // Resolve any pending promise
     if (state.pendingResolve) {
@@ -592,10 +839,27 @@ export class SubagentManager {
 
 // ── Pi invocation helper ──────────────────────────────────────────────────
 
+function isPiEntrypointScript(scriptPath: string | undefined): boolean {
+  if (!scriptPath) return false;
+  const basename = path.basename(scriptPath).toLowerCase();
+  if (/^pi(\.cmd|\.exe)?$/.test(basename)) return true;
+
+  const normalized = scriptPath.split(path.sep).join("/");
+  return (
+    normalized.includes("/@earendil-works/pi-coding-agent/") ||
+    normalized.includes("/pi-coding-agent/")
+  );
+}
+
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1];
   const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+  if (
+    currentScript &&
+    !isBunVirtualScript &&
+    fs.existsSync(currentScript) &&
+    isPiEntrypointScript(currentScript)
+  ) {
     return { command: process.execPath, args: [currentScript, ...args] };
   }
 

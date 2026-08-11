@@ -41,10 +41,31 @@ import {
   type IdentitySpec,
   type SubagentDetails,
   type SubagentResult,
+  type SubagentExecutionPolicy,
   formatUsageStats,
   getFinalOutput,
   MAX_PARALLEL_TASKS,
 } from "./subagent-runner.js";
+import {
+  privilegedExecRuntimeRegistry,
+  type PrivilegedExecOrigin,
+  type PrivilegedExecRequest,
+  type PrivilegedExecResult,
+} from "./privileged-exec-protocol.js";
+import {
+  activeToolNamesFromApi,
+  authorizeSubagentLaunch,
+  authorizeSubagentLaunchWithFreshProjection,
+} from "./companion-policy.js";
+import { installDurableSubagentReportLifecycle } from "./durable-report-lifecycle.js";
+import { SUBAGENT_REPORT_MESSAGE_TYPE } from "./durable-reports.js";
+
+const SubagentId = Type.String({
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+  description: "Bounded routing ID: ASCII alphanumerics followed by ASCII alphanumerics, dot, underscore, colon, or hyphen",
+});
 
 // ── Extension Entry Point ───────────────────────────────────────────────────
 
@@ -52,30 +73,38 @@ export default function (pi: ExtensionAPI) {
   // ── State ──────────────────────────────────────────────────────────────
   const subagentManager = new SubagentManager();
   let goals: Goal[] = [];
+  let companionToolsDisabled = false;
   let nextGoalId = 1;
+  let privilegedRuntimeKey: string | null = null;
 
-  // Wire up subagent → orchestrator notifications.
-  // When a subagent prefixes its output with [NOTIFY], the message is queued
-  // for the orchestrator's next turn so it sees it without polling.
-  subagentManager.setNotifyHandler((agentId, content) => {
-    try {
-      pi.sendMessage(
-        {
-          customType: "subagent-notify",
-          content: `[from subagent: ${agentId}]\n${content}`,
-          display: true,
-          details: { agentId, content },
-        },
-        { deliverAs: "nextTurn" },
-      );
-    } catch {
-      // ignore — sendMessage may throw if session is shutting down
-    }
+  const privilegedError = (message: string): PrivilegedExecResult => ({
+    ok: false,
+    exitCode: null,
+    signal: null,
+    stdoutBase64: "",
+    stderrBase64: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    error: message,
   });
 
-  pi.registerMessageRenderer("subagent-notify", (message, _options, theme) => {
-    const details = (message as any).details as { agentId?: string; content?: string } | undefined;
-    const agentId = details?.agentId ?? "subagent";
+  const routePrivilegedExec = async (
+    request: PrivilegedExecRequest,
+    origin: PrivilegedExecOrigin,
+    signal: AbortSignal,
+  ): Promise<PrivilegedExecResult> => {
+    if (!privilegedRuntimeKey) return privilegedError("parent privileged broker session is unavailable");
+    const runtime = privilegedExecRuntimeRegistry().get(privilegedRuntimeKey);
+    if (!runtime) return privilegedError("parent privileged broker runtime is unavailable");
+    return runtime.execute(request, origin, signal);
+  };
+
+  subagentManager.setPrivilegedExecHandler(routePrivilegedExec);
+  installDurableSubagentReportLifecycle(pi, subagentManager);
+
+  pi.registerMessageRenderer(SUBAGENT_REPORT_MESSAGE_TYPE, (message, _options, theme) => {
+    const details = (message as any).details as { agentId?: string; content?: string; durableReportIds?: string[] } | undefined;
+    const agentId = details?.agentId ?? (details?.durableReportIds?.length ? "subagents" : "subagent");
     const body = details?.content ?? message.content;
     const header = theme.fg("accent", theme.bold(`↑ notify from "${agentId}"`));
     return new Text(`${header}\n${theme.fg("toolOutput", body)}`, 0, 0);
@@ -98,19 +127,110 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  const SUBAGENT_TOOL_NAMES = new Set([
+    "subagent_spawn",
+    "subagent_send",
+    "subagent_poll",
+    "subagent_stop",
+    "subagent_list",
+    "subagent_dispatch",
+  ]);
+
+  const activeToolNames = (): string[] => activeToolNamesFromApi(pi.getActiveTools() as unknown);
+  const executionPolicy = (ctx: ExtensionContext): SubagentExecutionPolicy => ({
+    parentCwd: ctx.cwd,
+    parentTools: activeToolNames(),
+    parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+    parentSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+  });
+
+  const authorizeChild = (
+    ctx: ExtensionContext,
+    targetCwd: string | undefined,
+    requestedTools?: string | string[],
+  ) => authorizeSubagentLaunch({
+    parentCwd: ctx.cwd,
+    targetCwd: targetCwd || ctx.cwd,
+    parentTools: activeToolNames(),
+    requestedTools,
+    parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+    parentSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+  });
+
+  const authorizeChildForAvailability = (
+    ctx: ExtensionContext,
+  ) => authorizeSubagentLaunchWithFreshProjection({
+    parentCwd: ctx.cwd,
+    targetCwd: ctx.cwd,
+    parentTools: activeToolNames(),
+    requestedTools: [],
+    parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+    parentSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+  });
+
+  const enforceCompanionToolAvailability = async (ctx: ExtensionContext): Promise<void> => {
+    try {
+      await authorizeChildForAvailability(ctx);
+    } catch (error) {
+      if (!companionToolsDisabled) {
+        const reason = error instanceof Error ? error.message : "unknown companion-policy denial";
+        console.warn(`[agent-teams] disabling subagent tools: ${reason}`);
+        const retained = activeToolNames().filter((name) => !SUBAGENT_TOOL_NAMES.has(name));
+        pi.setActiveTools(retained);
+        companionToolsDisabled = true;
+      }
+      await subagentManager.stopAll();
+    }
+  };
+
+  // Frontend entry preflight. execute() and each process manager/runner repeat
+  // this check, so later argument mutation or a stale projection cannot bypass it.
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "subagent_spawn" && event.toolName !== "subagent_dispatch") return;
+    const input = event.input as any;
+    try {
+      if (event.toolName === "subagent_spawn") {
+        const decision = authorizeChild(ctx, input.cwd, input.tools);
+        input.tools = decision.effectiveTools.join(",");
+      } else {
+        const items = Array.isArray(input.tasks)
+          ? input.tasks
+          : Array.isArray(input.chain)
+            ? input.chain
+            : [input];
+        for (const item of items) {
+          const decision = authorizeChild(ctx, item.cwd, item.tools);
+          item.tools = decision.effectiveTools.join(",");
+        }
+      }
+    } catch (error) {
+      return {
+        block: true,
+        reason: error instanceof Error ? error.message : "Companion policy denied subagent launch",
+      };
+    }
+  });
+
   // ── Session events ─────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
     restoreGoals(ctx);
+    privilegedRuntimeKey = ctx.sessionManager.getSessionId()
+      ?? ctx.sessionManager.getSessionFile()
+      ?? `ephemeral:${process.pid}:${ctx.cwd}`;
+    await enforceCompanionToolAvailability(ctx);
   });
 
   pi.on("session_shutdown", async () => {
+    subagentManager.setPrivilegedExecHandler(undefined);
+    privilegedRuntimeKey = null;
     await subagentManager.stopAll();
   });
 
   // ── Inject goals context ───────────────────────────────────────────────
 
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (_event, ctx) => {
+    await enforceCompanionToolAvailability(ctx);
     if (goals.length === 0) return;
     const activeGoals = goals.filter((g) => !g.completed);
     if (activeGoals.length === 0) return;
@@ -323,13 +443,8 @@ export default function (pi: ExtensionAPI) {
       "Pick a `style` that matches the pattern: 'team-member' (default) for substantive owned work that decomposes into goals; 'worker' for narrow request/reply roles like a dictionary or thesaurus that don't have a project to plan; 'minimal' when your system_prompt already says everything needed and you want no auto-injected coaching.",
     ],
     parameters: Type.Object({
-      id: Type.String({
-        description:
-          "Unique, descriptive ID for this subagent (e.g., 'pdf-scout-downloads'). Used for routing messages.",
-      }),
-      parent_id: Type.Optional(
-        Type.String({ description: "Parent subagent ID if spawned from another subagent" }),
-      ),
+      id: SubagentId,
+      parent_id: Type.Optional(SubagentId),
       system_prompt: Type.String({
         description:
           "REQUIRED. The system prompt that designs this subagent's identity — its role, scope, constraints, and reporting format. Write it fresh for each spawn; do not assume a registry of predefined identities.",
@@ -389,14 +504,29 @@ export default function (pi: ExtensionAPI) {
       const orchestratorModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
       const model = params.model || orchestratorModel;
 
+      let authorization;
+      try {
+        authorization = authorizeChild(ctx, params.cwd, params.tools);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Companion policy denied subagent spawn: ${error instanceof Error ? error.message : String(error)}` }],
+          details: {},
+          isError: true,
+        };
+      }
+      const parentTools = activeToolNames();
       const spec: SubagentSpec = {
         id: params.id,
         parentId: params.parent_id,
         agentName: params.id,
         systemPrompt: enrichedPrompt,
-        tools: params.tools,
+        tools: authorization.effectiveTools.join(","),
         model,
         cwd: params.cwd || ctx.cwd,
+        policyParentCwd: ctx.cwd,
+        policyParentTools: parentTools,
+        policyParentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+        policyParentSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
       };
 
       try {
@@ -453,7 +583,7 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     promptSnippet: "Send a follow-up message to a running subagent",
     parameters: Type.Object({
-      id: Type.String({ description: "Subagent ID to send to" }),
+      id: SubagentId,
       message: Type.String({ description: "Message to send to the subagent" }),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -526,7 +656,7 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     promptSnippet: "Check subagent status and retrieve new messages",
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Subagent ID to poll. Omit to poll all." })),
+      id: Type.Optional(SubagentId),
       wait: Type.Optional(Type.Boolean({ description: "If true, block until the subagent is idle, then return full output. Only valid when 'id' is provided." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -644,7 +774,7 @@ export default function (pi: ExtensionAPI) {
     description: "Stop a running subagent by ID. Use 'all' to stop all subagents.",
     promptSnippet: "Stop a running subagent",
     parameters: Type.Object({
-      id: Type.String({ description: "Subagent ID to stop, or 'all' to stop all" }),
+      id: SubagentId,
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (params.id === "all") {
@@ -874,6 +1004,9 @@ export default function (pi: ExtensionAPI) {
           signal,
           onUpdate,
           makeDetails("single"),
+          routePrivilegedExec,
+          [],
+          executionPolicy(ctx),
         );
         const isError =
           result.exitCode !== 0 ||
@@ -925,6 +1058,9 @@ export default function (pi: ExtensionAPI) {
           signal,
           onUpdate,
           makeDetails("parallel"),
+          routePrivilegedExec,
+          [],
+          executionPolicy(ctx),
         );
 
         const successCount = results.filter((r) => r.exitCode === 0).length;
@@ -960,6 +1096,9 @@ export default function (pi: ExtensionAPI) {
         signal,
         onUpdate,
         makeDetails("chain"),
+        routePrivilegedExec,
+        [],
+        executionPolicy(ctx),
       );
 
       const lastResult = results[results.length - 1];

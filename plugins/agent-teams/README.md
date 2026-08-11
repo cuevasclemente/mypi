@@ -80,6 +80,23 @@ Main Pi Agent (Orchestrator)
 
 ## Key Behaviors
 
+### Wayang companion policy (fail closed)
+
+Every spawn/dispatch consults Wayang's private `project-access-policy.json` projection at the frontend tool preflight, in the long-lived manager, and immediately before process creation. The extension matches the current parent Pi session file/id to the projection's `agent_profile_id`; every non-null Standard-project allowlist requires that exact source profile. Missing, stale, malformed, contradictory, unknown, unattributed, disallowed, or protected parent/target policy denies without fallback. Standalone Pi can target only Standard projects whose allowlist is null.
+
+Child policy can only narrow the parent:
+
+- requested tools are intersected with the parent's active tools;
+- children always retain only requested/parent-allowed reviewed built-ins `read`, `edit`, `write`, `grep`, `find`, and `ls`; bash, `sudo_exec`, and custom/unknown tools are removed regardless of project mix;
+- an empty intersection launches with `--no-tools`, never Pi defaults;
+- general child extension discovery is disabled and only `child-policy-guard.ts` is loaded explicitly;
+- the guard reloads the private live projection before every path-tool call and denies protected roots, every Standard root whose non-null allowlist excludes the source profile, every projected Pi transcript path/directory, Pi session storage, Wayang attachment/data/control roots, command-guard identity PIN storage, the legacy shared upload root, recursive ancestor scans, policy tightening, symlink escapes, and nonexistent-parent escapes;
+- command-guard identity PIN environment variables are removed from child environments by key without reading their values;
+- the projection generation, exact projection path, attributed source profile, parent project, target project, and effective tool ceiling are propagated to the child;
+- live sends and privileged requests re-check current policy.
+
+Protected projects have all Agent Teams tools removed/denied. Policy relaxation requires a new/reloaded session before tools are restored. This is a participating Wayang/Pi boundary, not isolation from arbitrary same-UID processes.
+
 ### Shared Goals
 
 Active goals (created with `goals_add`) are automatically injected into subagent system prompts when spawned. Each subagent sees the current goals and can work towards them. The orchestrator should:
@@ -105,7 +122,7 @@ Subagents can be restricted to specific tools via the `tools` parameter. This is
 
 - `"read, bash"` — read-only access
 - `"read, bash, edit, write, grep, find, ls"` — full coding access
-- Omit for the default tool set
+- Omit to inherit the parent's current active tool set (never a broader Pi default)
 
 ## Designing an Identity
 
