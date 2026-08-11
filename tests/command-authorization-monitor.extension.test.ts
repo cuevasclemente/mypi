@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import commandAuthorizationMonitor from "./command-authorization-monitor.ts";
+import commandAuthorizationMonitor from "../plugins/command-authorization-monitor.ts";
 
 const PIN_FILENAME = "command-guard-identity-pin";
 const DENIAL = "Protected identity configuration is unavailable to agent tools.";
