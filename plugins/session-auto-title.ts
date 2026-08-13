@@ -8,6 +8,33 @@ import { createHash, randomUUID } from "node:crypto";
 export const PI_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE = "pi-interactive-turn-source.v1";
 export const AUTO_TITLE_PROVIDER = "openai-codex";
 export const AUTO_TITLE_MODEL = "gpt-5.6-terra";
+const PINNED_TERRA_BASE_URL = "https://chatgpt.com/backend-api";
+const PINNED_TERRA_MODEL: Readonly<Model<"openai-codex-responses">> = Object.freeze({
+  id: AUTO_TITLE_MODEL,
+  name: "GPT-5.6 Terra",
+  api: "openai-codex-responses",
+  provider: AUTO_TITLE_PROVIDER,
+  baseUrl: PINNED_TERRA_BASE_URL,
+  reasoning: true,
+  input: Object.freeze(["text", "image"]) as ("text" | "image")[],
+  cost: Object.freeze({
+    input: 2,
+    output: 12,
+    cacheRead: 0.2,
+    cacheWrite: 2.5,
+    tiers: Object.freeze([Object.freeze({
+      inputTokensAbove: 272_000,
+      input: 4,
+      output: 18,
+      cacheRead: 0.4,
+      cacheWrite: 5,
+    })]) as unknown as Model<"openai-codex-responses">["cost"]["tiers"],
+  }),
+  contextWindow: 272_000,
+  maxTokens: 128_000,
+  thinkingLevelMap: Object.freeze({ xhigh: "xhigh", max: "max", minimal: "low" }),
+  compat: Object.freeze({ supportsOpenAIGrammarTools: true, supportsToolSearch: true }),
+});
 export const MAX_RAW_USER_CODE_POINTS = 4_096;
 export const MAX_SIDE_CODE_POINTS = 1_900;
 export const MAX_INPUT_CODE_POINTS = 12 * 1024;
@@ -157,22 +184,40 @@ const SYSTEM_PROMPT = [
   `Use at most ${MAX_TITLE_CODE_POINTS} Unicode characters.`,
 ].join(" ");
 
+function isPinnedTerraDescriptor(model: Model<any> | undefined): boolean {
+  return Boolean(model)
+    && model!.provider === AUTO_TITLE_PROVIDER
+    && model!.id === AUTO_TITLE_MODEL
+    && model!.api === "openai-codex-responses"
+    && model!.baseUrl === PINNED_TERRA_BASE_URL
+    && model!.headers === undefined;
+}
+
+function hasEntries(value: object | undefined): boolean {
+  return value !== undefined && Object.keys(value).length > 0;
+}
+
 class TerraProvider implements ExtensionTitleProvider {
   async prepare(ctx: ExtensionContext): Promise<PreparedTitleProvider> {
-    const builtIn = getModel(AUTO_TITLE_PROVIDER, AUTO_TITLE_MODEL);
+    const catalog = getModel(AUTO_TITLE_PROVIDER, AUTO_TITLE_MODEL);
     const selected = ctx.modelRegistry.find(AUTO_TITLE_PROVIDER, AUTO_TITLE_MODEL);
     if (
-      !builtIn || !selected
-      || builtIn.api !== "openai-codex-responses"
-      || selected.api !== builtIn.api
-      || selected.provider !== builtIn.provider
-      || selected.id !== builtIn.id
-      || selected.baseUrl !== builtIn.baseUrl
+      !isPinnedTerraDescriptor(catalog)
+      || !isPinnedTerraDescriptor(selected)
+      || !ctx.modelRegistry.isUsingOAuth(PINNED_TERRA_MODEL as Model<"openai-codex-responses">)
       || ctx.modelRegistry.getRegisteredProviderConfig(AUTO_TITLE_PROVIDER) !== undefined
+      || ctx.modelRegistry.getRegisteredNativeProvider(AUTO_TITLE_PROVIDER) !== undefined
     ) throw new Error("title_model_unavailable");
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(builtIn);
-    if (!auth.ok || (auth.baseUrl && auth.baseUrl !== builtIn.baseUrl)) throw new Error("title_model_unavailable");
-    const requestAuth = { apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(PINNED_TERRA_MODEL as Model<"openai-codex-responses">);
+    if (
+      !auth.ok
+      || typeof auth.apiKey !== "string"
+      || auth.apiKey.length === 0
+      || auth.baseUrl !== undefined
+      || hasEntries(auth.headers)
+      || hasEntries(auth.env)
+    ) throw new Error("title_model_unavailable");
+    const apiKey = auth.apiKey;
     return {
       dispatch(input: string): Promise<string> {
         const controller = new AbortController();
@@ -182,10 +227,8 @@ class TerraProvider implements ExtensionTitleProvider {
           systemPrompt: SYSTEM_PROMPT,
           messages: [{ role: "user", content: input, timestamp: Date.now() }],
         };
-        const stream = streamSimple(builtIn as Model<"openai-codex-responses">, context, {
-          apiKey: requestAuth.apiKey,
-          headers: requestAuth.headers,
-          env: requestAuth.env,
+        const stream = streamSimple(PINNED_TERRA_MODEL as Model<"openai-codex-responses">, context, {
+          apiKey,
           signal: controller.signal,
           timeoutMs: 20_000,
           maxRetries: 0,
