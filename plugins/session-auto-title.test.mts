@@ -48,7 +48,10 @@ function harness(provider: ExtensionTitleProvider) {
   };
   createSessionAutoTitleExtension({ provider })(pi as ExtensionAPI);
   async function emit(name: string, event: any): Promise<void> {
-    for (const handler of handlers.get(name) ?? []) await handler(event, ctx as ExtensionContext);
+    const delivered = name === "input" && typeof event?.text === "string" && event.originalText === undefined
+      ? { ...event, originalText: event.text }
+      : event;
+    for (const handler of handlers.get(name) ?? []) await handler(delivered, ctx as ExtensionContext);
   }
   function appendExchange(index: number): void {
     manager.appendMessage({ role: "user", content: `prompt ${index}`, timestamp: Date.now() } as any);
@@ -108,6 +111,46 @@ test("identity-neutral TUI extension marks exact interactive turns and titles af
     const info = entries.filter((entry) => entry.type === "session_info").at(-1);
     assert.equal(info?.origin, "automatic");
     assert.match(h.notifications[0]!, /TUI session title/);
+  } finally {
+    if (previous === undefined) delete process.env.PI_AUTO_SESSION_TITLE;
+    else process.env.PI_AUTO_SESSION_TITLE = previous;
+    h.cleanup();
+  }
+});
+
+test("immutable original input excludes text injected by earlier transforms", async () => {
+  const inputs: string[] = [];
+  const h = harness({
+    async prepare() {
+      return { dispatch: async (input) => { inputs.push(input); return "Original input title"; } };
+    },
+  });
+  const previous = process.env.PI_AUTO_SESSION_TITLE;
+  process.env.PI_AUTO_SESSION_TITLE = "on";
+  try {
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    for (let index = 1; index <= 3; index++) {
+      const transformed = `injected /private/generated/path ${index}`;
+      await h.emit("input", {
+        type: "input",
+        source: "interactive",
+        text: transformed,
+        originalText: `raw human ${index}`,
+      });
+      h.manager.appendMessage({ role: "user", content: transformed, timestamp: Date.now() } as any);
+      h.manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: `answer ${index}` }],
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+      await h.emit("agent_settled", { type: "agent_settled" });
+    }
+    await waitFor(() => h.manager.getSessionName() === "Original input title");
+    assert.match(inputs[0]!, /raw human 1/);
+    assert.doesNotMatch(inputs[0]!, /private\/generated|injected/);
   } finally {
     if (previous === undefined) delete process.env.PI_AUTO_SESSION_TITLE;
     else process.env.PI_AUTO_SESSION_TITLE = previous;

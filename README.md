@@ -27,7 +27,7 @@ If you use pi and want ideas (or working code) for new providers, subagent orche
 
 `session-auto-title` is inert unless `PI_AUTO_SESSION_TITLE=on`. When enabled, it sends deterministically bounded prose from the first three marked interactive TUI exchanges to the fixed `openai-codex/gpt-5.6-terra` model. It excludes RPC/JSON/print/headless inputs, extension-origin turns, unmarked historical sessions, tool calls/results, reasoning, images, system prompts, later turns, and Wayang-owned session managers. Human names use the same pinned Pi lock and win races.
 
-Conversation prose can itself contain private facts, paths, or credentials authored by the human or repeated by the assistant. Enabling the flag authorizes that disclosure. Failures retry only after another completed marked exchange; setting the flag to any value other than `on` disables new attempts. The repository pins `@earendil-works/pi-coding-agent` to the vendored `0.84.1-wayang.529ab5c1` artifact (SHA-256 `bbeb42d927bea1caea334c9f4129eedf6b1eeb6537445a57fc39adf9f3738245`) for the shared session-name CAS API.
+Conversation prose can itself contain private facts, paths, or credentials authored by the human or repeated by the assistant. Enabling the flag authorizes that disclosure. Failures retry only after another completed marked exchange; setting the flag to any value other than `on` disables new attempts. The repository pins `@earendil-works/pi-coding-agent` to the vendored `0.84.1-wayang.6c8f459b` artifact (SHA-256 `3bbaf6b36dd48ed3f2b7ccdee9993eff467094c9934bcaafc32c119940a798c6`) for the shared session-name CAS API.
 
 ### Workflow utilities
 

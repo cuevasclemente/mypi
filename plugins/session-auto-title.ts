@@ -332,12 +332,21 @@ export function createSessionAutoTitleExtension(options: { provider?: ExtensionT
 
     pi.on("input", (event, ctx) => {
       currentContext = ctx;
-      if (!enabled(ctx) || event.source !== "interactive" || !event.text.trim() || pi.getSessionName() !== undefined) return;
+      if (
+        !enabled(ctx)
+        || event.source !== "interactive"
+        || typeof event.originalText !== "string"
+        || !event.originalText.trim()
+        || pi.getSessionName() !== undefined
+      ) return;
       pending.push({
         token: randomUUID(),
         acceptedAt: Date.now(),
         acceptedEntryCount: ctx.sessionManager.getEntries().length,
-        rawUserText: truncate(event.text, MAX_RAW_USER_CODE_POINTS),
+        rawUserText: truncate(event.originalText, MAX_RAW_USER_CODE_POINTS),
+        // Bind the marker to the current text at this handler. A later handler
+        // transform then fails closed instead of attaching raw text to a
+        // different persisted user entry.
         contentSha256: hash(event.text),
       });
     });
