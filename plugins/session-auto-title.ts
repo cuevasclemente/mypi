@@ -225,7 +225,10 @@ function wayangOwns(manager: object): boolean {
 }
 
 function enabled(ctx: ExtensionContext): boolean {
+  const manager = ctx.sessionManager as any;
   return process.env.PI_AUTO_SESSION_TITLE === "on"
+    && typeof manager.getSessionNameState === "function"
+    && typeof manager.appendSessionInfoIfCurrent === "function"
     && ctx.mode === "tui"
     && ctx.hasUI
     && Boolean(ctx.sessionManager.getSessionFile())
