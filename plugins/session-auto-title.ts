@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
+import { getModel } from "@earendil-works/pi-ai/compat";
+import { streamSimple } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import type { Context, Model } from "@earendil-works/pi-ai";
 import { createHash, randomUUID } from "node:crypto";
 
