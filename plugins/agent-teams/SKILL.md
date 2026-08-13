@@ -17,6 +17,22 @@ Agent teams let you split complex work across multiple stateful subagents that c
 | Simple one-shot work | Use `subagent_dispatch` (single or parallel) |
 | Complex multi-step coordination | Spawn multiple stateful subagents, coordinate via send/poll |
 
+## Authorization Boundary
+
+Agent Teams is a participating Wayang companion and fails closed against the metadata-only `project-access-policy.json` projection.
+
+- The parent project and every target `cwd` must be known and allow subagents.
+- The current parent Pi session file/id must map to the projection's source `agent_profile_id` whenever the parent or target Standard project has a non-null allowlist; only an exact allowlist match passes.
+- Standalone/unattributed Pi may target only Standard projects with a null allowlist.
+- Protected, missing, stale, malformed, contradictory, unknown, unattributed, or disallowed policy denies.
+- Checks occur at frontend tool entry, in the manager, and immediately before process spawn.
+- A child receives only the intersection of requested tools and the parent's active tools.
+- Every child can receive only requested/parent-allowed `read`, `edit`, `write`, `grep`, `find`, and `ls`; bash, `sudo_exec`, and custom/unknown tools are always removed, even when all projects are Standard.
+- General extension discovery is disabled in children. The sole explicit reviewed extension reloads the live private projection before every path-tool call and denies protected roots, Standard roots whose allowlist excludes the source profile, projected/Pi transcript storage, Wayang attachment/data/control roots, command-guard identity PIN storage, the legacy shared upload root, recursive ancestor scans, policy tightening, and symlink/nonexistent-parent escapes.
+- Child launch removes command-guard PIN environment variables by key without reading their values.
+- Do not retry a policy denial with a different cwd, direct Pi process, shell, or prompt-only workaround.
+- Policy relaxation requires a new/reloaded session to restore tools removed by fail-closed startup.
+
 ## Core Tools
 
 ### Stateful (Long-Lived) Subagents
@@ -85,7 +101,7 @@ By default, subagents inherit the same model you (the orchestrator) are using. O
 - The task is simple enough for a cheaper/faster model
 - The task needs a model with specific capabilities (e.g., vision)
 
-You can also specify which tools the subagent has access to via the `tools` parameter (comma-separated tool names like `"read, bash, grep, find, ls"`).
+You can also request tools via the `tools` parameter (comma-separated names like `"read, grep, find, ls"`). The effective child set is always intersected with the parent's active tools; omitting `tools` inherits that ceiling and can never broaden it.
 
 ## Sharing Goals with Subagents
 
@@ -270,7 +286,7 @@ spawn ──► running (processing initial task)
 2. **Design identities carefully** — a well-scoped identity prevents subagents from wandering into work they shouldn't do
 3. **Poll frequently** — don't leave subagents idle without checking their progress
 4. **Clean up** — always stop subagents when done; they survive across your orchestrator turns until stopped
-5. **Narrow tools** — restrict subagent tools via the `tools` parameter when they don't need write/edit access
+5. **Narrow tools** — request only what the child needs; companion policy intersects that request with the parent's active tool ceiling
 6. **Descriptive IDs** — use descriptive IDs like `"pdf-scout-downloads"`, not `"agent-1"`, so you can track which subagent produced which result
 7. **Synthesize** — after subagents finish, summarize findings and update goals
 
