@@ -115,6 +115,43 @@ test("identity-neutral TUI extension marks exact interactive turns and titles af
   }
 });
 
+test("interactive provenance resolves against all entries while requiring the current branch", async () => {
+  const h = harness({ async prepare() { throw new Error("not enough exchanges"); } });
+  const previous = process.env.PI_AUTO_SESSION_TITLE;
+  process.env.PI_AUTO_SESSION_TITLE = "on";
+  try {
+    const abandonedUserId = h.manager.appendMessage({ role: "user", content: "abandoned prompt", timestamp: Date.now() } as any);
+    h.manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "abandoned answer" }],
+      provider: "synthetic",
+      model: "synthetic",
+      stopReason: "stop",
+      timestamp: Date.now(),
+    } as any);
+    h.manager.branch(abandonedUserId);
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await h.emit("input", { type: "input", source: "interactive", text: "replacement prompt" });
+    const replacementUserId = h.manager.appendMessage({ role: "user", content: "replacement prompt", timestamp: Date.now() } as any);
+    h.manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "replacement answer" }],
+      provider: "synthetic",
+      model: "synthetic",
+      stopReason: "stop",
+      timestamp: Date.now(),
+    } as any);
+    await h.emit("agent_settled", { type: "agent_settled" });
+    const marker = (h.manager.getEntries() as any[]).find((entry) => entry.customType === PI_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE);
+    assert.equal(marker?.data.user_entry_id, replacementUserId);
+    assert.notEqual(marker?.data.user_entry_id, abandonedUserId);
+  } finally {
+    if (previous === undefined) delete process.env.PI_AUTO_SESSION_TITLE;
+    else process.env.PI_AUTO_SESSION_TITLE = previous;
+    h.cleanup();
+  }
+});
+
 test("RPC input and Wayang-owned managers never persist markers or call the provider", async () => {
   let calls = 0;
   const h = harness({ async prepare() { calls++; return { dispatch: async () => "No" }; } });

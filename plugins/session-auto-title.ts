@@ -242,14 +242,17 @@ function rememberAttempt(key: string): boolean {
   return true;
 }
 
-function resolvePendingInputs(pending: readonly PendingInput[], entries: readonly SessionEntry[]): Array<{ pending: PendingInput; userEntryId: string }> {
-  const branchIds = new Set(entries.map((entry) => entry.id));
+function resolvePendingInputs(
+  pending: readonly PendingInput[],
+  entries: readonly SessionEntry[],
+  currentBranchEntryIds: ReadonlySet<string>,
+): Array<{ pending: PendingInput; userEntryId: string }> {
   const assigned = new Set<string>();
   const result: Array<{ pending: PendingInput; userEntryId: string }> = [];
   for (const item of pending) {
     const candidate = entries.slice(item.acceptedEntryCount).find((entry) => (
       entry.type === "message"
-      && branchIds.has(entry.id)
+      && currentBranchEntryIds.has(entry.id)
       && !assigned.has(entry.id)
       && (entry.message as any)?.role === "user"
       && hash(textBlocks((entry.message as any).content)) === item.contentSha256
@@ -345,8 +348,9 @@ export function createSessionAutoTitleExtension(options: { provider?: ExtensionT
         pending = [];
         return;
       }
-      const entries = branch(ctx.sessionManager);
-      for (const resolved of resolvePendingInputs(pending, entries)) {
+      const entries = ctx.sessionManager.getEntries();
+      const currentBranchEntryIds = new Set(branch(ctx.sessionManager).map((entry) => entry.id));
+      for (const resolved of resolvePendingInputs(pending, entries, currentBranchEntryIds)) {
         pi.appendEntry(PI_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, {
           user_entry_id: resolved.userEntryId,
           raw_user_text: resolved.pending.rawUserText,
