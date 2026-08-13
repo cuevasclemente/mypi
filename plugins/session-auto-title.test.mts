@@ -137,6 +137,44 @@ test("RPC input and Wayang-owned managers never persist markers or call the prov
   }
 });
 
+test("provider failure retries only after the next completed marked exchange", async () => {
+  let calls = 0;
+  const h = harness({
+    async prepare() {
+      return {
+        dispatch: async () => {
+          calls++;
+          if (calls === 1) throw new Error("synthetic failure");
+          return "Fourth exchange retry";
+        },
+      };
+    },
+  });
+  const previous = process.env.PI_AUTO_SESSION_TITLE;
+  process.env.PI_AUTO_SESSION_TITLE = "on";
+  try {
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    for (let index = 1; index <= 3; index++) {
+      await h.emit("input", { type: "input", source: "interactive", text: `prompt ${index}` });
+      h.appendExchange(index);
+      await h.emit("agent_settled", { type: "agent_settled" });
+    }
+    await waitFor(() => calls === 1);
+    await h.emit("agent_settled", { type: "agent_settled" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 1);
+    await h.emit("input", { type: "input", source: "interactive", text: "prompt 4" });
+    h.appendExchange(4);
+    await h.emit("agent_settled", { type: "agent_settled" });
+    await waitFor(() => h.manager.getSessionName() === "Fourth exchange retry");
+    assert.equal(calls, 2);
+  } finally {
+    if (previous === undefined) delete process.env.PI_AUTO_SESSION_TITLE;
+    else process.env.PI_AUTO_SESSION_TITLE = previous;
+    h.cleanup();
+  }
+});
+
 test("human naming during the provider request wins the shared CAS", async () => {
   const response = deferred<string>();
   const dispatched = deferred<void>();
