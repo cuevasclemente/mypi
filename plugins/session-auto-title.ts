@@ -1,9 +1,10 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import type { Context, Model } from "@earendil-works/pi-ai";
 import { createHash, randomUUID } from "node:crypto";
+import * as path from "node:path";
 
 export const PI_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE = "pi-interactive-turn-source.v1";
 export const AUTO_TITLE_PROVIDER = "openai-codex";
@@ -184,6 +185,19 @@ const SYSTEM_PROMPT = [
   `Use at most ${MAX_TITLE_CODE_POINTS} Unicode characters.`,
 ].join(" ");
 
+let titleContextPromise: Promise<ModelRegistry> | null = null;
+
+async function titleModelRegistry(): Promise<ModelRegistry> {
+  titleContextPromise ??= ModelRuntime.create({
+    authPath: path.join(getAgentDir(), "auth.json"),
+    // Ordinary Pi model configuration must not substitute title OAuth/provider
+    // identity before the disclosure gate.
+    modelsPath: null,
+    allowModelNetwork: false,
+  }).then((runtime) => new ModelRegistry(runtime));
+  return titleContextPromise;
+}
+
 function isPinnedTerraDescriptor(model: Model<any> | undefined): boolean {
   return Boolean(model)
     && model!.provider === AUTO_TITLE_PROVIDER
@@ -198,17 +212,18 @@ function hasEntries(value: object | undefined): boolean {
 }
 
 class TerraProvider implements ExtensionTitleProvider {
-  async prepare(ctx: ExtensionContext): Promise<PreparedTitleProvider> {
+  async prepare(_ctx: ExtensionContext): Promise<PreparedTitleProvider> {
+    const registry = await titleModelRegistry();
     const catalog = getModel(AUTO_TITLE_PROVIDER, AUTO_TITLE_MODEL);
-    const selected = ctx.modelRegistry.find(AUTO_TITLE_PROVIDER, AUTO_TITLE_MODEL);
+    const selected = registry.find(AUTO_TITLE_PROVIDER, AUTO_TITLE_MODEL);
     if (
       !isPinnedTerraDescriptor(catalog)
       || !isPinnedTerraDescriptor(selected)
-      || !ctx.modelRegistry.isUsingOAuth(PINNED_TERRA_MODEL as Model<"openai-codex-responses">)
-      || ctx.modelRegistry.getRegisteredProviderConfig(AUTO_TITLE_PROVIDER) !== undefined
-      || ctx.modelRegistry.getRegisteredNativeProvider(AUTO_TITLE_PROVIDER) !== undefined
+      || !registry.isUsingOAuth(PINNED_TERRA_MODEL as Model<"openai-codex-responses">)
+      || registry.getRegisteredProviderConfig(AUTO_TITLE_PROVIDER) !== undefined
+      || registry.getRegisteredNativeProvider(AUTO_TITLE_PROVIDER) !== undefined
     ) throw new Error("title_model_unavailable");
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(PINNED_TERRA_MODEL as Model<"openai-codex-responses">);
+    const auth = await registry.getApiKeyAndHeaders(PINNED_TERRA_MODEL as Model<"openai-codex-responses">);
     if (
       !auth.ok
       || typeof auth.apiKey !== "string"
