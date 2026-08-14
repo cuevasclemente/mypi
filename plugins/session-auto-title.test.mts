@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   PI_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE,
@@ -289,4 +290,19 @@ test("title normalization rejects wrappers, controls, and oversized output", () 
   for (const value of ["Title: bad", "# bad", "Here is the title", "two\nlines", `bad\u202e`, "x".repeat(81)]) {
     assert.equal(normalizeTitle(value), null);
   }
+});
+
+test("built Pi jiti loader resolves the extension runtime imports", async () => {
+  const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const loaderUrl = pathToFileURL(path.join(path.dirname(packageEntry), "core/extensions/loader.js")).href;
+  const { loadExtensions } = await import(loaderUrl) as {
+    loadExtensions(paths: string[], cwd: string): Promise<{
+      extensions: unknown[];
+      errors: Array<{ path: string; error: string }>;
+    }>;
+  };
+  const extensionPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "session-auto-title.ts");
+  const result = await loadExtensions([extensionPath], process.cwd());
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.extensions.length, 1);
 });

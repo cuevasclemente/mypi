@@ -1,7 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { getModel } from "@earendil-works/pi-ai/compat";
-import { streamSimple } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import { getModel, openAICodexResponsesApi } from "@earendil-works/pi-ai/compat";
 import type { Context, Model } from "@earendil-works/pi-ai";
 import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
@@ -242,7 +241,12 @@ class TerraProvider implements ExtensionTitleProvider {
           systemPrompt: SYSTEM_PROMPT,
           messages: [{ role: "user", content: input, timestamp: Date.now() }],
         };
-        const stream = streamSimple(PINNED_TERRA_MODEL as Model<"openai-codex-responses">, context, {
+        // Pi's built Node extension loader aliases the pi-ai package root to
+        // its compat entrypoint. Keep runtime imports on that one exact
+        // subpath; a second /api/* import is otherwise rewritten below
+        // compat.js. The API-specific lazy factory still dispatches directly
+        // to the pinned Codex Responses implementation.
+        const stream = openAICodexResponsesApi().streamSimple(PINNED_TERRA_MODEL as Model<"openai-codex-responses">, context, {
           apiKey,
           signal: controller.signal,
           timeoutMs: 20_000,
