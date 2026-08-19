@@ -50,6 +50,9 @@ const COMMAND_GUARD_IDENTITY_PIN_FILENAME = "command-guard-identity-pin";
 const LEGACY_COMMAND_GUARD_IDENTITY_PIN_ENV = "PI_COMMAND_GUARD_IDENTITY_PIN";
 const FORBIDDEN_COMMAND_GUARD_PIN_ENV_NAMES = [LEGACY_COMMAND_GUARD_IDENTITY_PIN_ENV] as const;
 export const PROTECTED_IDENTITY_DENIAL_REASON = "Protected identity configuration is unavailable to agent tools.";
+export const UNRESOLVED_OPERATIONAL_EXPANSION_DENIAL_REASON =
+	"Command contains an unresolved operational shell expansion; use a literal path or an explicitly supported variable form.";
+type ProtectedAccessFinding = "protected-identity" | "unresolved-operational-expansion";
 const MAX_PROTECTED_ACCESS_INPUT_CHARS = 16_384;
 const MAX_PROTECTED_ACCESS_INPUT_NODES = 1_024;
 const MAX_PROTECTED_PATH_CANDIDATES = 256;
@@ -600,11 +603,33 @@ function expandSafePathPrefix(value: string): string {
 	return value;
 }
 
+function expandLiteralXdgRuntimeChildrenInCommand(command: string): string {
+	const runtimeDir = process.env.XDG_RUNTIME_DIR;
+	if (!runtimeDir || !path.isAbsolute(runtimeDir) || !/^\/[A-Za-z0-9._/-]+$/.test(runtimeDir)) return command;
+	const normalizedRuntimeDir = path.normalize(runtimeDir);
+	const replacement = (_match: string, prefix: string, child: string) => {
+		if (child === "." || child === "..") return _match;
+		return `${prefix}${path.join(normalizedRuntimeDir, child)}`;
+	};
+	// Match a complete unquoted or double-quoted shell word (or the value after
+	// an option/assignment '=') so quote-fragment concatenation cannot turn an
+	// approved single child into a deeper or traversing path after inspection.
+	return command
+		.replace(
+			/(^|[\s=;|&()<>])"\$(?:\{XDG_RUNTIME_DIR\}|XDG_RUNTIME_DIR)\/([A-Za-z0-9._-]+)"(?=$|[\s;|&()<>])/g,
+			replacement,
+		)
+		.replace(
+			/(^|[\s=;|&()<>])\$(?:\{XDG_RUNTIME_DIR\}|XDG_RUNTIME_DIR)\/([A-Za-z0-9._-]+)(?=$|[\s;|&()<>])/g,
+			replacement,
+		);
+}
+
 function expandKnownPathVariablesInCommand(command: string): string {
 	const configHome = process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME)
 		? process.env.XDG_CONFIG_HOME
 		: path.join(homedir(), ".config");
-	return command
+	return expandLiteralXdgRuntimeChildrenInCommand(command)
 		// Resolve the canonical shell fallback as one expression before expanding
 		// its nested $HOME. Any parameter syntax left afterward is unknown and is
 		// rejected when it occurs in an operational shell word.
@@ -770,9 +795,43 @@ type ShellToken =
 function startsShellExpansion(command: string, index: number): boolean {
 	const character = command[index];
 	if (character === "`") return true;
+	if ((character === "<" || character === ">") && command[index + 1] === "(") return true;
 	if (character !== "$") return false;
 	const next = command[index + 1];
-	return next === "{" || next === "(" || next === "`" || /[A-Za-z_0-9@*#?$!\-]/.test(next ?? "");
+	return next === "{" || next === "(" || next === "[" || next === "`" || next === "'" || next === '"'
+		|| /[A-Za-z_0-9@*#?$!\-]/.test(next ?? "");
+}
+
+function shellContainsExecutableExpansion(command: string): boolean {
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (let index = 0; index < command.length; index++) {
+		const character = command[index]!;
+		const next = command[index + 1];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (character === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (quote === "'") {
+			if (character === quote) quote = undefined;
+			continue;
+		}
+		if (character === "'") {
+			quote = character;
+			continue;
+		}
+		if (character === '"') {
+			quote = quote === '"' ? undefined : '"';
+			continue;
+		}
+		if (character === "`" || (character === "$" && (next === "(" || next === "["))) return true;
+		if (!quote && (character === "<" || character === ">") && next === "(") return true;
+	}
+	return false;
 }
 
 function shellTokens(command: string): ShellToken[] {
@@ -800,6 +859,13 @@ function shellTokens(command: string): ShellToken[] {
 			continue;
 		}
 		if (ch === "\\" && quote !== "'") {
+			// POSIX shells remove an unquoted or double-quoted backslash-newline
+			// pair before tokenization; mirror that so command names cannot be split
+			// across a continuation to evade wrapper or raw-sudo detection.
+			if (next === "\n") {
+				i++;
+				continue;
+			}
 			escaped = true;
 			atTokenBoundary = false;
 			continue;
@@ -886,23 +952,23 @@ function isShellInterpreter(base: string): boolean {
 	return ["bash", "sh", "dash", "zsh", "fish", "ksh"].includes(base);
 }
 
-function shellCommandPayloadFrom(tokens: ShellToken[], shellIndex: number): string | undefined {
-	for (let i = shellIndex + 1; i < tokens.length; i++) {
-		const token = tokens[i];
-		if (token.type === "operator") return undefined;
-		const word = token.value;
-		if (word === "--") continue;
-		if (!word.startsWith("-")) return undefined;
-		if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word)) {
-			const payload = tokens[i + 1];
-			return payload?.type === "word" ? payload.value : undefined;
+function exactArgvInvokesSudo(base: string, argv: string[], depth: number): boolean {
+	if (depth > MAX_COMMAND_WRAPPER_DEPTH) return true;
+	if (base === "sudo") return true;
+	if (base === "eval") return commandInvokesSudoInner(argv.join(" "), depth + 1);
+	const wrapped = parseWrappedCommand(base, argv);
+	if (wrapped.kind === "inner") return exactArgvInvokesSudo(wrapped.base, wrapped.argv, depth + 1);
+	if (!isShellInterpreter(base)) return false;
+	for (let index = 0; index < argv.length; index++) {
+		if (/^-[A-Za-z]*c[A-Za-z]*$/.test(argv[index]!) && typeof argv[index + 1] === "string") {
+			if (commandInvokesSudoInner(argv[index + 1]!, depth + 1)) return true;
 		}
 	}
-	return undefined;
+	return false;
 }
 
 function commandInvokesSudoInner(command: string, depth: number): boolean {
-	if (depth > 3) return false;
+	if (depth > MAX_COMMAND_WRAPPER_DEPTH) return true;
 	let expectCommand = true;
 	const tokens = shellTokens(command);
 
@@ -914,16 +980,11 @@ function commandInvokesSudoInner(command: string, depth: number): boolean {
 		}
 
 		const word = token.value;
-		const base = basenameWord(word);
 
 		if (expectCommand) {
 			if (isAssignmentWord(word)) continue;
-			if (base === "sudo") return true;
-			if (["env", "command", "time", "nohup", "nice"].includes(base)) continue;
-			if (isShellInterpreter(base)) {
-				const payload = shellCommandPayloadFrom(tokens, i);
-				if (payload && commandInvokesSudoInner(payload, depth + 1)) return true;
-			}
+			if (exactArgvInvokesSudo(basenameWord(word), commandArguments(tokens, i), depth)) return true;
+			if (["env", "command", "time", "nohup", "nice"].includes(basenameWord(word))) continue;
 			if (["if", "while", "until", "then", "do", "else", "elif"].includes(word)) continue;
 			expectCommand = false;
 			continue;
@@ -1030,6 +1091,13 @@ function parseXargsCommand(args: string[]): WrappedCommandParse {
 function parseWrappedCommand(base: string, args: string[]): WrappedCommandParse {
 	if (base === "env") return parseEnvCommand(args);
 	if (base === "xargs") return parseXargsCommand(args);
+
+	if (base === "exec") {
+		let index = 0;
+		if (args[index] === "--") index++;
+		if ((args[index] ?? "").startsWith("-")) return { kind: "protected" };
+		return innerCommand(args, index);
+	}
 
 	if (base === "command") {
 		for (let index = 0; index < args.length; index++) {
@@ -1203,25 +1271,40 @@ function shellDefaultsToCwdScope(command: string): boolean {
 	return false;
 }
 
-function exactArgvRequestsProtectedEnvironment(base: string, argv: string[], cwd: string, depth: number): boolean {
-	if (depth > MAX_COMMAND_WRAPPER_DEPTH) return true;
-	if (invocationDumpsEnvironment(base, argv)) return true;
+function exactArgvProtectedEnvironmentFinding(
+	base: string,
+	argv: string[],
+	cwd: string,
+	depth: number,
+): ProtectedAccessFinding | undefined {
+	if (depth > MAX_COMMAND_WRAPPER_DEPTH) return "unresolved-operational-expansion";
+	if (invocationDumpsEnvironment(base, argv)) return "protected-identity";
+	// Inline AWK can enumerate or select arbitrary process environment values.
+	// Treat any direct ENVIRON reference as protected rather than trying to prove
+	// which key an AWK expression will compute at runtime.
+	if (["awk", "gawk", "mawk", "nawk"].includes(base)
+		&& argv.some((argument) => /\bENVIRON\b/i.test(argument))) return "protected-identity";
 	const wrapped = parseWrappedCommand(base, argv);
-	if (wrapped.kind === "dump" || wrapped.kind === "protected") return true;
-	if (wrapped.kind === "inner") return exactArgvRequestsProtectedEnvironment(wrapped.base, wrapped.argv, cwd, depth + 1);
-	if (!isShellInterpreter(base)) return false;
+	if (wrapped.kind === "dump") return "protected-identity";
+	if (wrapped.kind === "protected") return "unresolved-operational-expansion";
+	if (wrapped.kind === "inner") return exactArgvProtectedEnvironmentFinding(wrapped.base, wrapped.argv, cwd, depth + 1);
+	if (!isShellInterpreter(base)) return undefined;
+	let unresolved = false;
 	for (let index = 0; index < argv.length; index++) {
 		if (/^-[A-Za-z]*c[A-Za-z]*$/.test(argv[index]!) && typeof argv[index + 1] === "string") {
-			return protectedShellCommandRequested(argv[index + 1]!, cwd, depth + 1);
+			const finding = protectedShellCommandFinding(argv[index + 1]!, cwd, depth + 1);
+			if (finding === "protected-identity") return finding;
+			if (finding === "unresolved-operational-expansion") unresolved = true;
 		}
 	}
-	return false;
+	return unresolved ? "unresolved-operational-expansion" : undefined;
 }
 
-function shellInvokesBroadEnvironmentRead(command: string, cwd: string, depth: number): boolean {
-	if (depth > MAX_COMMAND_WRAPPER_DEPTH) return true;
+function shellProtectedEnvironmentFinding(command: string, cwd: string, depth: number): ProtectedAccessFinding | undefined {
+	if (depth > MAX_COMMAND_WRAPPER_DEPTH) return "unresolved-operational-expansion";
 	const tokens = shellTokens(command);
 	let expectCommand = true;
+	let unresolved = false;
 
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index]!;
@@ -1237,10 +1320,12 @@ function shellInvokesBroadEnvironmentRead(command: string, cwd: string, depth: n
 		const word = token.value;
 		if (isAssignmentWord(word)) continue;
 		if (["if", "while", "until", "then", "do", "else", "elif"].includes(word)) continue;
-		if (exactArgvRequestsProtectedEnvironment(basenameWord(word), commandArguments(tokens, index), cwd, depth)) return true;
+		const finding = exactArgvProtectedEnvironmentFinding(basenameWord(word), commandArguments(tokens, index), cwd, depth);
+		if (finding === "protected-identity") return finding;
+		if (finding === "unresolved-operational-expansion") unresolved = true;
 		expectCommand = false;
 	}
-	return false;
+	return unresolved ? "unresolved-operational-expansion" : undefined;
 }
 
 function shellPathCandidates(word: string): string[] {
@@ -1312,7 +1397,7 @@ function awkProgramIsDataOnly(program: string): boolean {
 			let end = index + 1;
 			while (end < program.length && /[A-Za-z0-9_]/.test(program[end]!)) end++;
 			const identifier = program.slice(index, end).toLowerCase();
-			if (identifier === "getline" || identifier === "system") return false;
+			if (identifier === "environ" || identifier === "getline" || identifier === "system") return false;
 			index = end - 1;
 			continue;
 		}
@@ -1498,8 +1583,10 @@ function classifyAwkPrograms(tokens: ShellToken[], argumentIndexes: readonly num
 	const dataWordIndexes = new Set<number>();
 	let allInlineProgramsSafe = inlinePrograms.length > 0;
 	for (const program of inlinePrograms) {
-		if (awkProgramIsDataOnly(program.source)) dataWordIndexes.add(program.wordIndex);
-		else allInlineProgramsSafe = false;
+		const token = tokens[program.wordIndex];
+		if (token?.type === "word" && !token.unresolvedShellExpansion && awkProgramIsDataOnly(program.source)) {
+			dataWordIndexes.add(program.wordIndex);
+		} else allInlineProgramsSafe = false;
 	}
 	return {
 		dataWordIndexes,
@@ -1578,8 +1665,10 @@ function classifySedPrograms(tokens: ShellToken[], argumentIndexes: readonly num
 	const dataWordIndexes = new Set<number>();
 	let allInlineProgramsSafe = inlinePrograms.length > 0;
 	for (const program of inlinePrograms) {
-		if (sedProgramIsDataOnly(program.source)) dataWordIndexes.add(program.wordIndex);
-		else allInlineProgramsSafe = false;
+		const token = tokens[program.wordIndex];
+		if (token?.type === "word" && !token.unresolvedShellExpansion && sedProgramIsDataOnly(program.source)) {
+			dataWordIndexes.add(program.wordIndex);
+		} else allInlineProgramsSafe = false;
 	}
 	return {
 		dataWordIndexes,
@@ -1626,6 +1715,15 @@ function shellDataWordIndexes(tokens: ShellToken[], redirectionOperands: Readonl
 			for (let offset = 0; offset < argumentIndexes.length; offset++) {
 				const argumentIndex = argumentIndexes[offset]!;
 				const argument = (tokens[argumentIndex] as { type: "word"; value: string }).value;
+				if (["-f", "--file"].includes(argument)) {
+					if (argumentIndexes[offset + 1] !== undefined) offset++;
+					hasExplicitPattern = true;
+					continue;
+				}
+				if (/^(?:-f.+|--file=.+)$/.test(argument)) {
+					hasExplicitPattern = true;
+					continue;
+				}
 				if (["-e", "--regexp", "-g", "--glob", "--iglob"].includes(argument)) {
 					if (argumentIndexes[offset + 1] !== undefined) data.add(argumentIndexes[++offset]!);
 					if (argument === "-e" || argument === "--regexp") hasExplicitPattern = true;
@@ -1683,12 +1781,15 @@ function shellOperationalReferenceMatches(command: string, expression: RegExp): 
 	return false;
 }
 
-export function protectedShellCommandRequested(command: string, cwd: string, depth = 0): boolean {
-	if (!command) return false;
-	if (command.length > MAX_PROTECTED_ACCESS_INPUT_CHARS || depth > 3) return true;
+function protectedShellCommandFinding(command: string, cwd: string, depth = 0): ProtectedAccessFinding | undefined {
+	if (!command) return undefined;
+	if (command.length > MAX_PROTECTED_ACCESS_INPUT_CHARS || depth > 3) return "unresolved-operational-expansion";
 	const inspectionCommand = expandKnownPathVariablesInCommand(command);
-	if (shellDefaultsToCwdScope(inspectionCommand) && protectedPathScopeRequested(".", cwd)) return true;
-	if (shellInvokesBroadEnvironmentRead(inspectionCommand, cwd, depth)) return true;
+	if (shellDefaultsToCwdScope(inspectionCommand) && protectedPathScopeRequested(".", cwd)) return "protected-identity";
+	const environmentFinding = shellProtectedEnvironmentFinding(inspectionCommand, cwd, depth);
+	if (environmentFinding === "protected-identity") return environmentFinding;
+	let unresolved = environmentFinding === "unresolved-operational-expansion"
+		|| shellContainsExecutableExpansion(inspectionCommand);
 
 	const tokens = shellTokens(inspectionCommand);
 	const redirectionOperands = shellRedirectionOperandIndexes(tokens);
@@ -1696,11 +1797,21 @@ export function protectedShellCommandRequested(command: string, cwd: string, dep
 	let inspectedCandidates = 0;
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index]!;
-		if (token.type !== "word" || dataWords.has(index)) continue;
+		if (token.type !== "word") continue;
+		if (dataWords.has(index)) {
+			// Literal patterns/programs may mention protected-looking text, but a
+			// shell-expanded PIN variable or AWK ENVIRON lookup would disclose the
+			// value before the nominally read-only program runs.
+			if ((token.unresolvedShellExpansion || /\bENVIRON\s*\[/i.test(token.value))
+				&& IDENTITY_PIN_CONFIG_ACCESS_RE.test(token.value)) return "protected-identity";
+			continue;
+		}
 		// Known HOME/XDG forms were expanded before tokenization. Any remaining
 		// active parameter/command/backtick expansion can change an executable,
 		// path, assignment, or redirection operand at runtime, so fail closed.
-		if (token.unresolvedShellExpansion) return true;
+		// Continue scanning so an actual protected identity reference wins over
+		// the less-specific unresolved-expansion finding.
+		if (token.unresolvedShellExpansion) unresolved = true;
 		if (redirectionOperands.has(index)) {
 			const previous = tokens[index - 1];
 			if (previous?.type === "operator" && isHereDocumentOperator(previous.value)) continue;
@@ -1709,10 +1820,15 @@ export function protectedShellCommandRequested(command: string, cwd: string, dep
 			if (previous?.type === "operator" && [">&", "<&"].includes(previous.value) && /^(?:\d+|-)$/.test(token.value)) continue;
 		}
 		for (const candidate of shellPathCandidates(token.value)) {
-			if (++inspectedCandidates > MAX_PROTECTED_PATH_CANDIDATES || operationalStringRequestsProtectedAccess(candidate, cwd)) return true;
+			if (++inspectedCandidates > MAX_PROTECTED_PATH_CANDIDATES) unresolved = true;
+			else if (operationalStringRequestsProtectedAccess(candidate, cwd)) return "protected-identity";
 		}
 	}
-	return false;
+	return unresolved ? "unresolved-operational-expansion" : undefined;
+}
+
+export function protectedShellCommandRequested(command: string, cwd: string, depth = 0): boolean {
+	return protectedShellCommandFinding(command, cwd, depth) !== undefined;
 }
 
 // Direct awk/sed programs are treated as data only when their inline source is
@@ -1735,21 +1851,24 @@ function sudoArgumentPathRequested(argument: string, cwd: string): boolean {
 	return candidates.some((candidate) => operationalStringRequestsProtectedAccess(candidate, cwd));
 }
 
-function sudoExecRequestsProtectedAccess(input: Record<string, unknown>, cwd: string): boolean {
+function sudoExecProtectedAccessFinding(
+	input: Record<string, unknown>,
+	cwd: string,
+): ProtectedAccessFinding | undefined {
 	const executable = typeof input.executable === "string" ? input.executable : "";
-	if (!executable) return false;
+	if (!executable) return undefined;
 	const argv = Array.isArray(input.argv) && input.argv.every((argument) => typeof argument === "string")
 		? input.argv as string[]
 		: [];
 	const explicitCwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : undefined;
 	const executionCwd = explicitCwd ?? cwd;
-	if (operationalStringRequestsProtectedAccess(executable, cwd)) return true;
-	if (explicitCwd && operationalStringRequestsProtectedAccess(explicitCwd, cwd)) return true;
-	if (argv.some((argument) => sudoArgumentPathRequested(argument, executionCwd))) return true;
+	if (operationalStringRequestsProtectedAccess(executable, cwd)) return "protected-identity";
+	if (explicitCwd && operationalStringRequestsProtectedAccess(explicitCwd, cwd)) return "protected-identity";
+	if (argv.some((argument) => sudoArgumentPathRequested(argument, executionCwd))) return "protected-identity";
 	const base = basenameWord(executable);
-	if (exactArgvDefaultsToCwdScope(base, argv) && protectedPathScopeRequested(executionCwd, cwd)) return true;
+	if (exactArgvDefaultsToCwdScope(base, argv) && protectedPathScopeRequested(executionCwd, cwd)) return "protected-identity";
 
-	return exactArgvRequestsProtectedEnvironment(base, argv, executionCwd, 0);
+	return exactArgvProtectedEnvironmentFinding(base, argv, executionCwd, 0);
 }
 
 const BUILTIN_PATH_TOOL_NAMES = new Set(["read", "grep", "find", "ls", "write", "edit"]);
@@ -1782,7 +1901,10 @@ function unknownOperationalValueRequestsProtectedAccess(
 	}
 }
 
-function unknownToolOperationalAccessRequested(record: Record<string, unknown>, cwd: string): boolean {
+function unknownToolOperationalAccessFinding(
+	record: Record<string, unknown>,
+	cwd: string,
+): ProtectedAccessFinding | undefined {
 	const budget: ProtectedInputBudget = {
 		remainingChars: MAX_PROTECTED_ACCESS_INPUT_CHARS,
 		remainingNodes: MAX_PROTECTED_ACCESS_INPUT_NODES,
@@ -1790,42 +1912,56 @@ function unknownToolOperationalAccessRequested(record: Record<string, unknown>, 
 	for (const [field, value] of Object.entries(record)) {
 		if (!OPERATIONAL_TOOL_INPUT_FIELDS.has(field)) continue;
 		if (field === "command" && typeof value === "string") {
-			if (!consumeOperationalBudget(value, budget) || protectedShellCommandRequested(value, cwd)) return true;
+			if (!consumeOperationalBudget(value, budget)) return "unresolved-operational-expansion";
+			const finding = protectedShellCommandFinding(value, cwd);
+			if (finding) return finding;
 			continue;
 		}
-		if (unknownOperationalValueRequestsProtectedAccess(value, cwd, budget)) return true;
+		if (unknownOperationalValueRequestsProtectedAccess(value, cwd, budget)) return "protected-identity";
 	}
-	return false;
+	return undefined;
 }
 
-export function protectedToolAccessRequested(toolName: string, input: unknown, cwd: string): boolean {
+function protectedToolAccessFinding(toolName: string, input: unknown, cwd: string): ProtectedAccessFinding | undefined {
 	const record = toolInputRecord(input);
-	if (!record) return false;
+	if (!record) return undefined;
 	if (toolName === "bash") {
-		return protectedShellCommandRequested(typeof record.command === "string" ? record.command : "", cwd);
+		return protectedShellCommandFinding(typeof record.command === "string" ? record.command : "", cwd);
 	}
-	if (toolName === "sudo_exec") return sudoExecRequestsProtectedAccess(record, cwd);
+	if (toolName === "sudo_exec") return sudoExecProtectedAccessFinding(record, cwd);
 	if (BUILTIN_PATH_TOOL_NAMES.has(toolName)) {
-		if (typeof record.path === "string") return protectedPathScopeRequested(record.path, cwd);
+		if (typeof record.path === "string") return protectedPathScopeRequested(record.path, cwd) ? "protected-identity" : undefined;
 		// read/write/edit require path and reject omission. grep/find/ls use cwd
 		// for omitted, empty, and bare-@ paths (the latter two are normalized by
 		// protectedPathScopeRequested above).
-		return CWD_DEFAULTING_PATH_TOOL_NAMES.has(toolName) && protectedPathScopeRequested(".", cwd);
+		return CWD_DEFAULTING_PATH_TOOL_NAMES.has(toolName) && protectedPathScopeRequested(".", cwd)
+			? "protected-identity"
+			: undefined;
 	}
 	// Extension tools are unknown to this guard. Conservatively inspect only
 	// conventional operational fields, never payload fields such as pattern,
 	// content, edits, oldText, newText, or replacements.
-	return unknownToolOperationalAccessRequested(record, cwd);
+	return unknownToolOperationalAccessFinding(record, cwd);
 }
 
-function protectedToolDenial(): { block: true; reason: string } {
-	return { block: true, reason: PROTECTED_IDENTITY_DENIAL_REASON };
+export function protectedToolAccessRequested(toolName: string, input: unknown, cwd: string): boolean {
+	return protectedToolAccessFinding(toolName, input, cwd) !== undefined;
 }
 
-function protectedUserBashDenial() {
+function protectedAccessDenialReason(finding: ProtectedAccessFinding): string {
+	return finding === "protected-identity"
+		? PROTECTED_IDENTITY_DENIAL_REASON
+		: UNRESOLVED_OPERATIONAL_EXPANSION_DENIAL_REASON;
+}
+
+function protectedToolDenial(finding: ProtectedAccessFinding): { block: true; reason: string } {
+	return { block: true, reason: protectedAccessDenialReason(finding) };
+}
+
+function protectedUserBashDenial(finding: ProtectedAccessFinding) {
 	return {
 		result: {
-			output: PROTECTED_IDENTITY_DENIAL_REASON,
+			output: protectedAccessDenialReason(finding),
 			exitCode: 1,
 			cancelled: false,
 			truncated: false,
@@ -2247,8 +2383,9 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 		// This invariant is independent of command-guard mode and model policy.
 		// Run it for every protected tool before any local allow, raw-sudo, mode,
 		// identity challenge, or monitor-model branch.
-		if (protectedToolAccessRequested(event.toolName, event.input, ctx.cwd)) {
-			return protectedToolDenial();
+		const protectedFinding = protectedToolAccessFinding(event.toolName, event.input, ctx.cwd);
+		if (protectedFinding) {
+			return protectedToolDenial(protectedFinding);
 		}
 		if (event.toolName !== "bash") return undefined;
 
@@ -2324,7 +2461,8 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 	pi.on("user_bash", (event, ctx) => {
 		const command = typeof event.command === "string" ? event.command : "";
 		const cwd = typeof event.cwd === "string" && event.cwd.length > 0 ? event.cwd : ctx.cwd;
-		if (protectedShellCommandRequested(command, cwd)) return protectedUserBashDenial();
+		const protectedFinding = protectedShellCommandFinding(command, cwd);
+		if (protectedFinding) return protectedUserBashDenial(protectedFinding);
 		return undefined;
 	});
 

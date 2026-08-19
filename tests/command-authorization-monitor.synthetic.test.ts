@@ -3,23 +3,29 @@ import { after, test } from "node:test";
 
 import commandAuthorizationMonitor, {
 	PROTECTED_IDENTITY_DENIAL_REASON,
+	UNRESOLVED_OPERATIONAL_EXPANSION_DENIAL_REASON,
 	protectedPathScopeRequested,
 	protectedShellCommandRequested,
 	protectedToolAccessRequested,
 } from "../plugins/command-authorization-monitor.ts";
 
 const originalConfigHome = process.env.XDG_CONFIG_HOME;
+const originalRuntimeDir = process.env.XDG_RUNTIME_DIR;
 const originalMode = process.env.PI_COMMAND_GUARD_MODE;
 const configHome = "/tmp/pi-command-guard-synthetic-config";
+const runtimeDir = "/tmp/pi-command-guard-synthetic-runtime";
 const workspace = "/tmp/pi-command-guard-synthetic-workspace";
 const pinPath = `${configHome}/pi/command-guard-identity-pin`;
 
 process.env.XDG_CONFIG_HOME = configHome;
+process.env.XDG_RUNTIME_DIR = runtimeDir;
 process.env.PI_COMMAND_GUARD_MODE = "off";
 
 after(() => {
 	if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
 	else process.env.XDG_CONFIG_HOME = originalConfigHome;
+	if (originalRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
+	else process.env.XDG_RUNTIME_DIR = originalRuntimeDir;
 	if (originalMode === undefined) delete process.env.PI_COMMAND_GUARD_MODE;
 	else process.env.PI_COMMAND_GUARD_MODE = originalMode;
 });
@@ -96,6 +102,45 @@ test("shell preflight catches environment and nested shell access while ordinary
 	}
 });
 
+test("shell preflight narrowly resolves literal XDG runtime children for control sockets", () => {
+	for (const command of [
+		'ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock" example-host hostname',
+		'ssh -S "${XDG_RUNTIME_DIR}/remote-maintenance.sock" example-host hostname',
+		'ssh -o ControlPath=$XDG_RUNTIME_DIR/remote-maintenance.sock example-host hostname',
+	]) {
+		assert.equal(protectedShellCommandRequested(command, workspace), false, `expected runtime socket form to pass: ${command}`);
+	}
+	for (const command of [
+		'ssh -S "$SOCK" example-host hostname',
+		'ssh -S "$XDG_RUNTIME_DIR/ssh/socket" example-host hostname',
+		'ssh -S "$XDG_RUNTIME_DIR/../socket" example-host hostname',
+		'ssh -S "$XDG_RUNTIME_DIR/*.sock" example-host hostname',
+		'ssh -S "$XDG_RUNTIME_DIR/%C" example-host hostname',
+		'ssh -S "${XDG_RUNTIME_DIR}/${NAME}" example-host hostname',
+		'ssh -S "$(printf socket)" example-host hostname',
+		'ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock"/nested example-host hostname',
+		'ssh -S prefix$XDG_RUNTIME_DIR/remote-maintenance.sock example-host hostname',
+		'ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock"/../other example-host hostname',
+	]) {
+		assert.equal(protectedShellCommandRequested(command, workspace), true, `expected dynamic runtime path denial: ${command}`);
+	}
+
+	const effectiveRuntimeDir = process.env.XDG_RUNTIME_DIR;
+	delete process.env.XDG_RUNTIME_DIR;
+	assert.equal(
+		protectedShellCommandRequested('ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock" example-host hostname', workspace),
+		true,
+		"unset runtime directory must fail closed",
+	);
+	process.env.XDG_RUNTIME_DIR = "relative/runtime";
+	assert.equal(
+		protectedShellCommandRequested('ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock" example-host hostname', workspace),
+		true,
+		"relative runtime directory must fail closed",
+	);
+	process.env.XDG_RUNTIME_DIR = effectiveRuntimeDir;
+});
+
 type Handler = (event: any, ctx: any) => unknown;
 
 function syntheticExtension() {
@@ -163,16 +208,38 @@ test("tool_call preflight is unconditional, fixed-reason, and before model execu
 			const result = await harness.dispatchTool({ toolName, input }, { ...harness.ctx, cwd });
 			assert.deepEqual(result, { block: true, reason: PROTECTED_IDENTITY_DENIAL_REASON });
 		}
+		assert.deepEqual(
+			await harness.dispatchTool({
+				toolName: "bash",
+				input: { command: 'ssh -S "$SOCK" example-host hostname' },
+			}, harness.ctx),
+			{ block: true, reason: UNRESOLVED_OPERATIONAL_EXPANSION_DENIAL_REASON },
+		);
 	}
+	assert.deepEqual(
+		await harness.dispatchTool({
+			toolName: "bash",
+			input: { command: `ssh -S "$SOCK" example-host 'cat ${pinPath}'` },
+		}, harness.ctx),
+		{ block: true, reason: PROTECTED_IDENTITY_DENIAL_REASON },
+		"protected identity references must take precedence over unresolved expansion",
+	);
 	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 0 });
 
 	process.env.PI_COMMAND_GUARD_MODE = "off";
 	assert.equal(await harness.dispatchTool({ toolName: "read", input: { path: "src/index.ts" } }, harness.ctx), undefined);
+	assert.equal(
+		await harness.dispatchTool({
+			toolName: "bash",
+			input: { command: 'ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock" example-host hostname' },
+		}, harness.ctx),
+		undefined,
+	);
 	assert.equal(await harness.dispatchTool({ toolName: "bash", input: { command: "printf ok" } }, harness.ctx), undefined);
-	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 2 });
+	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 3 });
 });
 
-test("user_bash returns a denial result before execution and passes ordinary controls", async () => {
+test("user_bash returns precise denial results before execution and passes ordinary controls", async () => {
 	const harness = syntheticExtension();
 	assert.equal(typeof harness.userBash, "function");
 
@@ -190,7 +257,25 @@ test("user_bash returns a denial result before execution and passes ordinary con
 			},
 		});
 	}
+	assert.deepEqual(
+		await harness.dispatchUserBash({ command: 'ssh -S "$SOCK" example-host hostname', cwd: workspace }, harness.ctx),
+		{
+			result: {
+				output: UNRESOLVED_OPERATIONAL_EXPANSION_DENIAL_REASON,
+				exitCode: 1,
+				cancelled: false,
+				truncated: false,
+			},
+		},
+	);
 	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 0 });
+	assert.equal(
+		await harness.dispatchUserBash({
+			command: 'ssh -S "$XDG_RUNTIME_DIR/remote-maintenance.sock" example-host hostname',
+			cwd: workspace,
+		}, harness.ctx),
+		undefined,
+	);
 	assert.equal(await harness.dispatchUserBash({ command: "printf ok", cwd: workspace }, harness.ctx), undefined);
-	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 1 });
+	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 2 });
 });

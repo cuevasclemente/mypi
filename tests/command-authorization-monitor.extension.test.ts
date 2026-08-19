@@ -7,6 +7,9 @@ import commandAuthorizationMonitor from "../plugins/command-authorization-monito
 
 const PIN_FILENAME = "command-guard-identity-pin";
 const DENIAL = "Protected identity configuration is unavailable to agent tools.";
+const UNRESOLVED_DENIAL =
+	"Command contains an unresolved operational shell expansion; use a literal path or an explicitly supported variable form.";
+const RAW_SUDO_DENIAL = "Raw sudo is disabled; use sudo_exec with an absolute executable path and exact argv.";
 const MODES = ["off", "audit", "balanced", "strict"] as const;
 const TOOL_NAMES = ["bash", "read", "grep", "find", "ls", "write", "edit", "sudo_exec"] as const;
 
@@ -79,16 +82,24 @@ function toolInput(toolName: typeof TOOL_NAMES[number], scope: string): Record<s
 	}
 }
 
-function assertGenericToolDenial(outcome: { result: any; executed: boolean }, modelLookups: number) {
+function assertGenericToolDenial(
+	outcome: { result: any; executed: boolean },
+	modelLookups: number,
+	expectedReason = DENIAL,
+) {
 	assert.equal(outcome.result?.block, true);
-	assert.equal(outcome.result?.reason, DENIAL);
+	assert.equal(outcome.result?.reason, expectedReason);
 	assert.ok(Buffer.byteLength(outcome.result.reason, "utf8") <= 128);
 	assert.equal(outcome.executed, false, "denial must not reach simulated tool execution");
 	assert.equal(modelLookups, 0, "denial must not route to a guard model");
 }
 
-function assertGenericUserBashDenial(outcome: { result: any; executed: boolean }, modelLookups: number) {
-	assert.equal(outcome.result?.result?.output, DENIAL);
+function assertGenericUserBashDenial(
+	outcome: { result: any; executed: boolean },
+	modelLookups: number,
+	expectedReason = DENIAL,
+) {
+	assert.equal(outcome.result?.result?.output, expectedReason);
 	assert.equal(outcome.result?.result?.exitCode, 1);
 	assert.ok(Buffer.byteLength(outcome.result.result.output, "utf8") <= 128);
 	assert.equal(outcome.executed, false, "denial must not reach simulated user shell execution");
@@ -387,15 +398,29 @@ test("unresolved shell expansions in operational words fail closed before mode o
 		'printf ignored > "${runtime_path}"',
 		'printf ignored > "$(printf runtime-path)"',
 		"printf ignored > \"`printf runtime-path`\"",
+		'cat <(printf runtime-path)',
+		'cat "$[1+1]"',
+		"cat $'/tmp/pi-command-guard-synthetic-config/pi/command-guard-identity-\\x70\\x69\\x6e'",
+		'p=\'BEGIN { for (name in ENVIRON) print ENVIRON[name] }\'; awk "$p"',
+		'sed_program=\'s|before|after|\'; sed "$sed_program" input.txt',
+		'printf ignored > >(cat)',
 	];
 
 	for (const mode of MODES) {
 		process.env.PI_COMMAND_GUARD_MODE = mode;
 		for (const command of commands) {
 			const toolHarness = createHarness(cwd);
-			assertGenericToolDenial(await toolHarness.tool("bash", { command }), toolHarness.modelLookups);
+			assertGenericToolDenial(
+				await toolHarness.tool("bash", { command }),
+				toolHarness.modelLookups,
+				UNRESOLVED_DENIAL,
+			);
 			const userHarness = createHarness(cwd);
-			assertGenericUserBashDenial(await userHarness.userBash(command), userHarness.modelLookups);
+			assertGenericUserBashDenial(
+				await userHarness.userBash(command),
+				userHarness.modelLookups,
+				UNRESOLVED_DENIAL,
+			);
 		}
 	}
 });
@@ -421,6 +446,32 @@ test("XDG fallback plus split PIN leaf overwrite/read bypasses are fixed for bas
 	}
 });
 
+test("data words cannot expand or query protected identity values", async () => {
+	const fixtureRoot = path.join(tmpdir(), `command-guard-data-word-identity-${process.pid}`);
+	process.env.XDG_CONFIG_HOME = path.join(fixtureRoot, "config");
+	const cwd = path.join(fixtureRoot, "project");
+	const pinPath = path.join(process.env.XDG_CONFIG_HOME, "pi", PIN_FILENAME);
+	const commands = [
+		'grep "$PI_COMMAND_GUARD_IDENTITY_PIN" /dev/null',
+		'grep -f "${XDG_CONFIG_HOME:-$HOME/.config}/pi/command-guard-identity-pin" /dev/null',
+		'awk \'BEGIN { print ENVIRON["PI_COMMAND_GUARD_IDENTITY_PIN"] }\'',
+		'awk \'BEGIN { for (name in ENVIRON) print ENVIRON[name] }\'',
+		'gawk \'BEGIN { for (name in ENVIRON) print ENVIRON[name] }\'',
+		'mawk \'BEGIN { for (name in ENVIRON) print ENVIRON[name] }\'',
+		`awk "BEGIN { print \\"$(cat ${pinPath})\\" }"`,
+	];
+
+	for (const mode of MODES) {
+		process.env.PI_COMMAND_GUARD_MODE = mode;
+		for (const command of commands) {
+			const toolHarness = createHarness(cwd);
+			assertGenericToolDenial(await toolHarness.tool("bash", { command }), toolHarness.modelLookups);
+			const userHarness = createHarness(cwd);
+			assertGenericUserBashDenial(await userHarness.userBash(command), userHarness.modelLookups);
+		}
+	}
+});
+
 test("safe grep rg awk and sed data words retain unresolved-expansion exclusions", async () => {
 	const fixtureRoot = path.join(tmpdir(), `command-guard-shell-data-expansion-${process.pid}`);
 	process.env.XDG_CONFIG_HOME = path.join(fixtureRoot, "config");
@@ -428,8 +479,8 @@ test("safe grep rg awk and sed data words retain unresolved-expansion exclusions
 	const commands = [
 		`grep "$needle" ${path.join(cwd, "input.txt")}`,
 		'rg "${needle}" ' + cwd,
-		'awk "BEGIN { print \\"$needle\\" }" ' + path.join(cwd, "input.txt"),
-		'sed "s|before|${replacement}|" ' + path.join(cwd, "input.txt"),
+		"awk 'BEGIN { print $1 }' " + path.join(cwd, "input.txt"),
+		"sed 's|before|after|' " + path.join(cwd, "input.txt"),
 	];
 
 	for (const mode of ["off", "balanced"] as const) {
@@ -547,6 +598,33 @@ test("symlink aliases are denied using fake parent metadata without creating or 
 		}
 	} finally {
 		rmSync(fixtureRoot, { recursive: true, force: true });
+	}
+});
+
+test("raw sudo remains denied through supported command wrappers in every mode", async () => {
+	const fixtureRoot = path.join(tmpdir(), `command-guard-wrapped-raw-sudo-${process.pid}`);
+	process.env.XDG_CONFIG_HOME = path.join(fixtureRoot, "config");
+	const cwd = path.join(fixtureRoot, "project");
+	const commands = [
+		"sudo id",
+		"timeout 1 sudo id",
+		"setsid sudo id",
+		"timeout 1 su\\" + "\n" + "do -n true",
+		"exec /usr/bin/sudo -n true",
+		"eval 'sudo -n true'",
+		"bash -c 'timeout 1 sudo id'",
+		"bash -c 'exec /usr/bin/sudo -n true'",
+	];
+	for (const mode of MODES) {
+		process.env.PI_COMMAND_GUARD_MODE = mode;
+		for (const command of commands) {
+			const harness = createHarness(cwd);
+			const outcome = await harness.tool("bash", { command });
+			assert.equal(outcome.result?.block, true, `${mode}/${command}`);
+			assert.equal(outcome.result?.reason, RAW_SUDO_DENIAL, `${mode}/${command}`);
+			assert.equal(outcome.executed, false, `${mode}/${command}`);
+			assert.equal(harness.modelLookups, 0, `${mode}/${command}`);
+		}
 	}
 });
 
