@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
 	buildPrompt,
+	chooseRequestedModel,
+	providerAwareGuardModels,
 	recentHumanAuthorizationInputs,
 } from "../plugins/command-authorization-monitor.ts";
 
@@ -23,6 +25,23 @@ function contextFor(branch: any[]) {
 		},
 	} as any;
 }
+
+test("Together primary models keep the guard on Together GLM-5.3-Flash only", () => {
+	const previousOverride = process.env.PI_COMMAND_GUARD_MODEL;
+	delete process.env.PI_COMMAND_GUARD_MODEL;
+	try {
+		for (const id of ["zai-org/GLM-5.3-Flash", "moonshotai/Kimi-K3", "Qwen/Qwen3.8-2.4T-A95B"]) {
+			const ctx = {
+				model: { provider: "together", id },
+			} as any;
+			assert.deepEqual(providerAwareGuardModels(ctx), ["together/zai-org/GLM-5.3-Flash"]);
+			assert.deepEqual(chooseRequestedModel(ctx), ["together/zai-org/GLM-5.3-Flash"]);
+		}
+	} finally {
+		if (previousOverride === undefined) delete process.env.PI_COMMAND_GUARD_MODEL;
+		else process.env.PI_COMMAND_GUARD_MODEL = previousOverride;
+	}
+});
 
 test("model authorization prompt contains the exact command and verified-human-only context", () => {
 	const visibleContaminant = "synthetic customer name and street address";

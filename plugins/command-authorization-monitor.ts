@@ -21,6 +21,7 @@
  *   - Pick a cheap/fast guard model from the active provider when possible
  *   - OpenRouter DeepSeek Pro routes to OpenRouter DeepSeek V4 Flash
  *   - GPT 5.6/5.5 via openai-codex routes to Luna or another cheap GPT guard model
+ *   - Together sessions route to Together GLM-5.3-Flash with no cross-provider fallback
  *   - If the active main model is narwhal-horn, reuse narwhal-horn for the guard
  *   - Override provider-aware routing with PI_COMMAND_GUARD_MODEL=provider/model-id
  */
@@ -34,6 +35,7 @@ import { matchesKey, Key, Text } from "@earendil-works/pi-tui";
 
 const DEFAULT_MONITOR_MODEL = "openrouter/deepseek/deepseek-v4-flash";
 const DIRECT_DEEPSEEK_FALLBACK = "deepseek/deepseek-v4-flash";
+const TOGETHER_GUARD_MODEL = "together/zai-org/GLM-5.3-Flash";
 const PROVIDER_GUARD_FALLBACKS: Record<string, string[]> = {
 	"claude-code": ["claude-code/haiku"],
 	"openai-codex": [
@@ -452,7 +454,7 @@ function uniqueModelSpecs(specs: Array<string | undefined>): string[] {
 	return result;
 }
 
-function providerAwareGuardModels(ctx: ExtensionContext): string[] {
+export function providerAwareGuardModels(ctx: ExtensionContext): string[] {
 	const active = ctx.model;
 	if (!active) return [DEFAULT_MONITOR_MODEL];
 	const activeSpec = modelSpec(active);
@@ -461,6 +463,11 @@ function providerAwareGuardModels(ctx: ExtensionContext): string[] {
 	// The local Narwhal provider is cheap/local, so reuse it rather than making a
 	// separate API call for command authorization.
 	if (active.provider === "narwhal-horn") return [activeSpec];
+
+	// A Together primary session is an explicit provider/privacy decision. Keep
+	// command text and human authorization context on Together GLM-5.3-Flash;
+	// if that route is unavailable, fail closed rather than crossing providers.
+	if (active.provider === "together") return [TOGETHER_GUARD_MODEL];
 
 	// Keep monitor spend/routing on the same provider family as the active model
 	// whenever that provider has a fast, low-cost sibling available.
@@ -488,10 +495,12 @@ function providerAwareGuardModels(ctx: ExtensionContext): string[] {
 	return [DEFAULT_MONITOR_MODEL];
 }
 
-function chooseRequestedModel(ctx: ExtensionContext): string[] {
+export function chooseRequestedModel(ctx: ExtensionContext): string[] {
 	const configured = process.env.PI_COMMAND_GUARD_MODEL?.trim();
 	if (configured) return uniqueModelSpecs([configured, DIRECT_DEEPSEEK_FALLBACK]);
-	return uniqueModelSpecs([...providerAwareGuardModels(ctx), DEFAULT_MONITOR_MODEL, DIRECT_DEEPSEEK_FALLBACK]);
+	const providerModels = providerAwareGuardModels(ctx);
+	if (ctx.model?.provider === "together") return uniqueModelSpecs(providerModels);
+	return uniqueModelSpecs([...providerModels, DEFAULT_MONITOR_MODEL, DIRECT_DEEPSEEK_FALLBACK]);
 }
 
 const SECRETISH_RE = /(^|[\s/'"])(\.env(?:\.|$)|.*credentials.*|.*api[_-]?key.*|.*token.*|.*secret.*|auth\.json|secure_data)([\s/'"]|$)/i;
@@ -2035,16 +2044,55 @@ function isLocallySafeSdlcCommand(command: string): boolean {
 	return segments.every((segment) => isReadOnlySegment(segment) || isSafeCdSegment(segment) || isSdlcSegment(segment));
 }
 
+function togetherGuardModel(active: any): any {
+	return {
+		...active,
+		id: "zai-org/GLM-5.3-Flash",
+		name: "GLM 5.3 Flash (Together command guard)",
+		provider: "together",
+		baseUrl: "https://api.together.ai/v1",
+		api: "openai-completions",
+		reasoning: true,
+		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
+		input: ["text", "image"],
+		cost: { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 },
+		contextWindow: 1_048_575,
+		maxTokens: 131_072,
+		samplingParams: {
+			...(active.samplingParams ?? {}),
+			reasoning_effort: "low",
+			temperature: 1,
+			top_p: 0.95,
+		},
+		compat: {
+			...(active.compat ?? {}),
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			maxTokensField: "max_tokens",
+			thinkingFormat: "together",
+			supportsStrictMode: false,
+			supportsLongCacheRetention: false,
+		},
+	};
+}
+
 function findMonitorModels(ctx: ExtensionContext): Array<{ spec: string; model: unknown }> {
 	const models: Array<{ spec: string; model: unknown }> = [];
 	for (const spec of chooseRequestedModel(ctx)) {
 		const parsed = parseModelSpec(spec);
 		if (!parsed) continue;
-		const registryModel = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
-		if (registryModel) {
-			models.push({ spec, model: registryModel });
+		const active = ctx.model;
+		if (active && modelSpec(active) === spec) {
+			models.push({ spec, model: active });
 			continue;
 		}
+		if (active?.provider === "together" && spec === TOGETHER_GUARD_MODEL) {
+			models.push({ spec, model: togetherGuardModel(active) });
+			continue;
+		}
+		const registryModel = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
+		if (registryModel) models.push({ spec, model: registryModel });
 	}
 	return models;
 }
@@ -2141,7 +2189,9 @@ export async function evaluateCommand(
 			// Some providers/models (notably Codex-backed accounts) reject an
 			// explicit temperature parameter. Omit it there so the guard remains
 			// available instead of fail-closing on provider option shape.
-			if ((model as any).provider !== "openai-codex") completionOptions.temperature = 0;
+			if ((model as any).provider !== "openai-codex") {
+				completionOptions.temperature = (model as any).provider === "together" ? 1 : 0;
+			}
 
 			const response = await complete(
 				model as any,
