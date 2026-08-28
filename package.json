@@ -1,11 +1,16 @@
 {
   "type": "module",
   "scripts": {
+    "test": "npm run test:session-auto-title && npm run test:memory-first-compaction",
+    "check": "npm run check:session-auto-title && npm run check:memory-first-compaction",
     "test:session-auto-title": "node --import tsx --test plugins/session-auto-title.test.mts",
-    "check:session-auto-title": "tsc --noEmit --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck plugins/session-auto-title.ts plugins/session-auto-title.test.mts"
+    "check:session-auto-title": "tsc --noEmit --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck plugins/session-auto-title.ts plugins/session-auto-title.test.mts",
+    "test:memory-first-compaction": "node --import tsx --test plugins/memory-first-compaction/*.test.mts",
+    "check:memory-first-compaction": "tsc --noEmit --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck plugins/memory-first-compaction/index.ts plugins/memory-first-compaction/state.ts plugins/memory-first-compaction/ledger.ts plugins/memory-first-compaction/maintain-ledger.ts plugins/memory-first-compaction/*.test.mts",
+    "ledger:memory-context": "node --import tsx plugins/memory-first-compaction/maintain-ledger.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.84.1-wayang.5bc35555.tgz",
+    "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.84.1-wayang.29fcca05.tgz",
     "@types/node": "^26.2.0",
     "exa-mcp-server": "^3.2.1",
     "tsx": "^4.23.12",

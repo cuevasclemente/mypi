@@ -21,13 +21,14 @@ If you use pi and want ideas (or working code) for new providers, subagent orche
 | `agent-teams`   | Long-lived, stateful subagents. The main pi agent designs each subagent's identity (name + system prompt) at spawn time, then messages and polls it as work progresses. Also supports one-shot dispatch (single / parallel / chain) and a goal-tracking system. See [`plugins/agent-teams/README.md`](plugins/agent-teams/README.md). |
 | `agent-monitor` | A cheap, fast watcher model that reviews each agent turn and flags meaningful milestones — useful for prompting journaling, memory updates, or other end-of-turn rituals. |
 | `session-auto-title` | Disabled-by-default, identity-neutral one-time Terra titles for ordinary interactive TUI sessions after three completed exchanges. |
+| `memory-first-compaction` | Independently opt-in persisted-memory guidance, 96K review/128K ordinary compaction sequencing, and a separate metadata-only HMAC ledger. See [`plugins/memory-first-compaction/README.md`](plugins/memory-first-compaction/README.md). |
 | `dreamer`       | Scheduled systemd user timer that reflects on recent sessions and proposes new skills to extract. |
 
 #### Automatic session-title disclosure
 
 `session-auto-title` is inert unless `PI_AUTO_SESSION_TITLE=on`. When enabled, it sends deterministically bounded prose from the first three marked interactive TUI exchanges to the fixed `openai-codex/gpt-5.6-terra` model. It excludes RPC/JSON/print/headless inputs, extension-origin turns, unmarked historical sessions, tool calls/results, reasoning, images, system prompts, later turns, and Wayang-owned session managers. Human names use the same pinned Pi lock and win races.
 
-Conversation prose can itself contain private facts, paths, or credentials authored by the human or repeated by the assistant. Enabling the flag authorizes that disclosure. Failures retry only after another completed marked exchange; setting the flag to any value other than `on` disables new attempts. The repository pins `@earendil-works/pi-coding-agent` to the vendored `0.84.1-wayang.5bc35555` artifact (SHA-256 `b25bad929297ebb76c0c95cae3d52304a5f40c2a3157fdf3e364b35423409b7a`) for the shared physical-file transaction and session-name CAS APIs.
+Conversation prose can itself contain private facts, paths, or credentials authored by the human or repeated by the assistant. Enabling the flag authorizes that disclosure. Failures retry only after another completed marked exchange; setting the flag to any value other than `on` disables new attempts. The repository pins `@earendil-works/pi-coding-agent` to the vendored `0.84.1-wayang.29fcca05` artifact (SHA-256 `fc09c52ec79888b30b10e63a985b3ba1c23a96e6ee37b5cf0f3ab1fdfbfb2007`) for the shared physical-file transaction, session-name CAS APIs, optional fixed compaction threshold, and optional complete-turn retention.
 
 ### Workflow utilities
 
@@ -90,6 +91,7 @@ mypi/
 │   ├── todo/             #   Persistent TODOs
 │   ├── agent-monitor.ts  #   End-of-turn milestone detector
 │   ├── session-auto-title.ts # Opt-in interactive Terra titles
+│   ├── memory-first-compaction/ # Opt-in memory review/compaction + metadata ledger
 │   ├── hooks.ts          #   Lifecycle hook runner
 │   ├── dreamer.ts        #   Session reflection → new skills
 │   └── ...
