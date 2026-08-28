@@ -4,7 +4,10 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { createMemoryFirstCompactionExtension } from "./index.js";
+import {
+  createMemoryFirstCompactionExtension,
+  WAYANG_MEMORY_FIRST_COHORT_ENTRY,
+} from "./index.js";
 import { MEMORY_STATE_ENTRY } from "./state.js";
 
 function harness(
@@ -292,6 +295,46 @@ test("ledger alone records per-request usage and compaction-summary usage withou
     [request.input_tokens, request.output_tokens, request.cache_read_tokens, request.cache_write_tokens, request.total_tokens, request.outcome],
     [100, 20, 30, 4, 154, "tool_use"],
   );
+});
+
+test("Wayang cohort requirement suppresses ledger writes until an exact content-free marker exists", async () => {
+  const ledgerEvents: any[] = [];
+  const h = harness(
+    {
+      PI_MEMORY_CONTEXT_LEDGER: "on",
+      PI_MEMORY_CONTEXT_REQUIRE_WAYANG_COHORT: "on",
+    },
+    [],
+    { append(identity: unknown, input: unknown) { ledgerEvents.push({ identity, input }); } },
+  );
+  await h.emit("session_start", startup);
+  h.setTokens(50_000);
+  await h.emit("before_agent_start", before);
+  await h.emit("message_end", {
+    message: {
+      role: "assistant", provider: "provider-raw", model: "model-raw", stopReason: "stop", timestamp: 1,
+      usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 12 },
+    },
+  });
+  assert.deepEqual(ledgerEvents, []);
+
+  h.entries.push({
+    type: "custom",
+    customType: WAYANG_MEMORY_FIRST_COHORT_ENTRY,
+    data: { schema_version: 1, privacy_mode: "standard", execution_mode: "interactive" },
+  });
+  await h.emit("message_end", {
+    message: {
+      role: "assistant", provider: "provider-raw", model: "model-raw", stopReason: "stop", timestamp: 2,
+      usage: { input: 20, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 24 },
+    },
+  });
+  const recorded = ledgerEvents as unknown as Array<{
+    identity: { sourceClass: string };
+    input: { event: string };
+  }>;
+  assert.deepEqual(recorded.map((item) => item.input.event), ["request_usage"]);
+  assert.equal(recorded[0]?.identity.sourceClass, "interactive");
 });
 
 test("session_compact resets typed generation state", async () => {

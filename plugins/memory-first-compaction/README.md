@@ -46,8 +46,9 @@ Ledger activation fails closed unless both are present:
 
 The extension does not discover or read key files. Tests inject a fixture key and temporary paths.
 
-Optional source classification:
+Optional source/cohort classification:
 
+- `PI_MEMORY_CONTEXT_REQUIRE_WAYANG_COHORT=on`: write only after the eligible Wayang runtime appends its strict content-free cohort marker. This keeps a service-wide ledger flag from broadening into unselected scheduled, Protected, or subagent cohorts.
 - `PI_MEMORY_CONTEXT_SOURCE_CLASS`: `interactive`, `rpc`, `scheduled`, `subagent`, or `unknown`
 - `PI_SCHEDULED_TASK=1` / `WAYANG_SCHEDULED_TASK=1`
 - `PI_AGENT_ROLE=subagent` / `MYPI_SUBAGENT=1`

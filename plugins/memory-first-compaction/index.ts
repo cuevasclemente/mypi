@@ -31,6 +31,8 @@ import {
   type UsageComponents,
 } from "./ledger.js";
 
+export const WAYANG_MEMORY_FIRST_COHORT_ENTRY = "wayang-memory-first-cohort-v1";
+
 const GUIDANCE = [
   "Memory context: Treat only an authorized Memoriki or a privacy-matched project wiki as persisted short- and long-term future-value memory.",
   "Read it when continuity matters; write information likely to help future work, including ongoing activities and projects, decisions, commitments, preferences, and reusable facts, within its authority and privacy scope.",
@@ -38,7 +40,26 @@ const GUIDANCE = [
   "Subagents should return future-value memory candidates to the parent unless explicitly authorized to write the matching memory.",
 ].join(" ");
 
+function wayangCohortSourceClass(ctx: ExtensionContext): MemorySourceClass | null {
+  for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+    if (entry.type !== "custom" || entry.customType !== WAYANG_MEMORY_FIRST_COHORT_ENTRY) continue;
+    const data = entry.data as Record<string, unknown> | undefined;
+    if (!data || Object.keys(data).sort().join(",") !== "execution_mode,privacy_mode,schema_version") continue;
+    if (data.schema_version !== 1 || (data.privacy_mode !== "standard" && data.privacy_mode !== "protected")) continue;
+    if (data.execution_mode === "interactive") return "interactive";
+    if (data.execution_mode === "scheduled") return "scheduled";
+    if (data.execution_mode === "subagent") return "subagent";
+  }
+  return null;
+}
+
+function ledgerCohortEligible(ctx: ExtensionContext, env: NodeJS.ProcessEnv): boolean {
+  return env.PI_MEMORY_CONTEXT_REQUIRE_WAYANG_COHORT !== "on" || wayangCohortSourceClass(ctx) !== null;
+}
+
 function sourceClass(ctx: ExtensionContext, env: NodeJS.ProcessEnv): MemorySourceClass {
+  const wayangCohort = wayangCohortSourceClass(ctx);
+  if (wayangCohort) return wayangCohort;
   const configured = env.PI_MEMORY_CONTEXT_SOURCE_CLASS;
   if (configured && (SOURCE_CLASSES as readonly string[]).includes(configured)) return configured as MemorySourceClass;
   if (env.PI_AGENT_ROLE === "subagent" || env.MYPI_SUBAGENT === "1") return "subagent";
@@ -161,6 +182,10 @@ export function createMemoryFirstCompactionExtension(options: {
 
     const recordLedger = (ctx: ExtensionContext, input: Parameters<MetadataLedger["append"]>[1]): void => {
       if (!flags.ledger || !ledger) return;
+      if (!ledgerCohortEligible(ctx, env)) {
+        ledgerStatus = "waiting: no eligible Wayang cohort marker";
+        return;
+      }
       const identity = ledgerIdentity(ctx);
       if (!identity) {
         ledgerStatus = "blocked: session identity is unavailable";
