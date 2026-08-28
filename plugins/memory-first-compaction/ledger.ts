@@ -210,8 +210,8 @@ export function isLedgerAggregate(value: unknown): value is LedgerAggregate {
     && validUsage(record);
 }
 
-function assertPrivateDirectory(directory: string): void {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+function assertPrivateDirectory(directory: string, create = true): void {
+  if (create) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("metadata directory must be a regular directory");
   if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
@@ -219,15 +219,16 @@ function assertPrivateDirectory(directory: string): void {
   }
 }
 
-function openPrivateFile(filePath: string): number {
-  assertPrivateDirectory(path.dirname(filePath));
+function openPrivateFile(filePath: string, create = true): number {
+  assertPrivateDirectory(path.dirname(filePath), create);
   if (fs.existsSync(filePath)) {
     const stat = fs.lstatSync(filePath);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("metadata target must be a regular file");
     if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("metadata target is not private");
   }
   const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-  const fd = fs.openSync(filePath, fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_APPEND | noFollow, 0o600);
+  const createFlag = create ? fs.constants.O_CREAT : 0;
+  const fd = fs.openSync(filePath, createFlag | fs.constants.O_RDWR | fs.constants.O_APPEND | noFollow, 0o600);
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || (process.platform !== "win32" && ((stat.mode & 0o077) !== 0 || stat.nlink !== 1))) {
@@ -413,6 +414,19 @@ function normalizedUsage(input: UsageComponents): UsageComponents {
     cache_write_tokens: Math.max(0, Math.round(input.cache_write_tokens)),
     total_tokens: Math.max(0, Math.round(input.total_tokens)),
   };
+}
+
+export function readValidatedLedgerFile(filePath: string): MemoryLedgerRecord[] {
+  if (!path.isAbsolute(filePath)) throw new Error("ledger path must be absolute");
+  const release = acquireMetadataLock(filePath);
+  let fd: number | undefined;
+  try {
+    fd = openPrivateFile(filePath, false);
+    return parseAndRecover(fd, isMemoryLedgerRecord);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    release();
+  }
 }
 
 export class MetadataLedger {

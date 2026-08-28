@@ -85,6 +85,35 @@ Writing aggregates before pruning makes reruns recoverable: a failure between th
 
 The append path currently validates/scans the full JSONL for dedupe and recovery. That scaling characteristic is intentionally unchanged for this pre-canary phase and must be load-tested before live rollout; it is not a reason to weaken lock ownership or risk silent content loss.
 
+## Source reconciliation gate
+
+A strict metadata-only reference file can reconcile ledger request and compaction-summary usage against transcript, provider, scheduled, or subagent totals. Reference rows contain only source/source-class labels, request counts, and token components—never IDs, paths, prompts, or transcript content.
+
+```json
+{
+  "schema_version": 1,
+  "references": [{
+    "source": "transcript",
+    "source_class": "interactive",
+    "requests": 100,
+    "input_tokens": 1000000,
+    "output_tokens": 50000,
+    "cache_read_tokens": 4000000,
+    "cache_write_tokens": 0,
+    "total_tokens": 5050000
+  }]
+}
+```
+
+```bash
+npm run reconcile:memory-context -- \
+  /absolute/path/to/metadata.jsonl \
+  /absolute/path/to/reference.json \
+  --max-variance 0.005
+```
+
+The report is content-free and passes only when every metric for every reference row is within the reviewed 0.5% expected-relative variance. Zero expected/actual passes; a nonzero value against zero expected fails. Exit status is `0` for pass, `2` for variance failure, and `1` for malformed or unsafe input.
+
 ## Validation
 
 ```bash
