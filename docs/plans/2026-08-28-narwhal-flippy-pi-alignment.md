@@ -1,7 +1,7 @@
 # Narwhal-Flippy reviewed-safe Pi alignment
 
 Date: 2026-08-28
-Status: implementation authorized
+Status: completed; Together AI parity required and verified, other auth-gated providers intentionally out of scope
 Branch: `ops/narwhal-flippy-pi-alignment-20260828`
 Base: `b53fc26a77af294e7bb6008e0a6e2810ff639828`
 Target: `clemente@192.168.50.204` (`narwhal-flippy`)
@@ -13,7 +13,7 @@ Bring Narwhal-Flippy materially closer to The-Sceptre's Pi setup using only clea
 Success means:
 
 - Narwhal-Flippy resolves user-owned Pi `0.84.1-wayang.4f7d03ce` before its existing root-owned Pi `0.75.3`;
-- `pi --offline --list-models` matches The-Sceptre's public provider/model catalog wherever the same host-local authentication is already present, with exact remaining auth-gated deltas reported rather than credentials copied;
+- `pi --offline --list-models` matches The-Sceptre for Together AI and every other already-authenticated in-scope provider; Anthropic/OpenRouter visibility is intentionally out of scope and no credentials are copied;
 - the root package remains untouched as immediate rollback;
 - the current canonical identity-neutral global context and clean neutral skill set are installed backup-first;
 - only newer extensions with clean independently reviewed source branches are added;
@@ -179,6 +179,6 @@ A fresh subagent is not required for mechanical remote commands; if a gate is am
 - Exact hash parity for all pre-existing extensions.
 - Deployment of any uncommitted runtime-extension integration.
 - Dense progressive-skill model/cache installation.
-- Copying provider credentials or secret-bearing model/auth/settings files. Public model-catalog metadata is in scope; missing authentication remains a protected user-mediated follow-up.
+- Copying provider credentials or secret-bearing model/auth/settings files. Public Together AI and already-authenticated catalog metadata are in scope; Anthropic/OpenRouter auth-gated rows are intentionally left out.
 - Wayang installation or agent-profile propagation.
 - Enabling any scheduled agent activity on Narwhal-Flippy.
