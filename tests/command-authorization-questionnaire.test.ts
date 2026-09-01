@@ -6,7 +6,7 @@ import test from "node:test";
 // exercises its exported human-input projection, and rejects forged/malformed
 // Wayang custom-message provenance before installing the extension.
 test("command guard recognizes durable Wayang questionnaire authorization", () => {
-  const result = spawnSync(process.execPath, ["scripts/validate-extensions.js", "command-authorization-monitor"], {
+  const result = spawnSync(process.execPath, ["scripts/validate-extensions.cjs", "command-authorization-monitor"], {
     cwd: new URL("..", import.meta.url),
     encoding: "utf8",
   });

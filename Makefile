@@ -136,7 +136,7 @@ install-companion-policy:
 	@PI_AGENT_DIR='$(PI_USER_AGENT_DIR)' bash scripts/install-companion-policy-runtime.sh
 
 check-companion-policy:
-	@node scripts/validate-extensions.js
+	@node scripts/validate-extensions.cjs
 	@node --test tests/agent-teams-companion-policy.test.ts tests/agent-teams-durable-reports.test.ts
 	@node scripts/test-agent-teams-tool-ceiling.mjs
 	@node scripts/test-dream-companion-policy.mjs
