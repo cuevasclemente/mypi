@@ -1,0 +1,107 @@
+{
+  "format": "mypi-neutral-parity-v1",
+  "release": "command-guard-neutral-parity",
+  "inventoryRoots": [
+    "plugins",
+    "skills"
+  ],
+  "sourceExclusions": [],
+  "components": {
+    "capabilities": [
+      {
+        "source": "plugins/command-authorization-monitor.ts",
+        "target": "extensions/command-authorization-monitor.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/agent-monitor.ts",
+        "target": "extensions/agent-monitor.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/session-auto-title.ts",
+        "target": "extensions/session-auto-title.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/hooks.ts",
+        "target": "extensions/hooks.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/interview.ts",
+        "target": "extensions/interview.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/questionnaire.ts",
+        "target": "extensions/questionnaire.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/agent-teams/index.ts",
+        "target": "extensions/agent-teams/index.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/todo/index.ts",
+        "target": "extensions/todo/index.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/narwhal-horn/index.ts",
+        "target": "extensions/narwhal-horn/index.ts",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "plugins/agent-teams/SKILL.md",
+        "target": "skills/agent-teams/SKILL.md",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "skills/mcp",
+        "target": "skills/mcp",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "skills/pi-monitors",
+        "target": "skills/pi-monitors",
+        "roles": ["narwhal", "sceptre"]
+      },
+      {
+        "source": "hooks.json.example",
+        "target": "hooks.json",
+        "roles": ["narwhal", "sceptre"]
+      }
+    ],
+    "neutral-context": [
+      {
+        "source": "deploy/neutral-context/AGENTS.md",
+        "target": "AGENTS.md",
+        "roles": ["narwhal"]
+      }
+    ]
+  },
+  "quarantine": {
+    "capabilities": {
+      "narwhal": [
+        "extensions/agent-teams.ts",
+        "extensions/narwhal-horn.ts",
+        "extensions/todo.ts"
+      ],
+      "sceptre": [
+        "extensions/agent-teams.ts",
+        "extensions/narwhal-horn.ts",
+        "extensions/todo.ts"
+      ]
+    },
+    "neutral-context": {
+      "narwhal": ["APPEND_SYSTEM.md"],
+      "sceptre": []
+    }
+  },
+  "protected": {
+    "narwhal": [],
+    "sceptre": ["AGENTS.md", "APPEND_SYSTEM.md"]
+  }
+}

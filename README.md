@@ -20,12 +20,9 @@ If you use pi and want ideas (or working code) for new providers, subagent orche
 |-----------------|--------------|
 | `agent-teams`   | Long-lived, stateful subagents. The main pi agent designs each subagent's identity (name + system prompt) at spawn time, then messages and polls it as work progresses. Also supports one-shot dispatch (single / parallel / chain) and a goal-tracking system. See [`plugins/agent-teams/README.md`](plugins/agent-teams/README.md). |
 | `agent-monitor` | A cheap, fast watcher model that reviews each agent turn and flags meaningful milestones — useful for prompting journaling, memory updates, or other end-of-turn rituals. |
-<<<<<<< HEAD
 | `session-auto-title` | Disabled-by-default, identity-neutral one-time Terra titles for ordinary interactive TUI sessions after three completed exchanges. |
 | `memory-first-compaction` | Independently opt-in persisted-memory guidance, 96K review/128K ordinary compaction sequencing, and a separate metadata-only HMAC ledger. See [`plugins/memory-first-compaction/README.md`](plugins/memory-first-compaction/README.md). |
-=======
 | `session-coordinator` | Filesystem-backed room/presence tooling so independent TUI/Wayang pi sessions in the same project can see peers, post notes, and claim work without being an agent team. |
->>>>>>> feature/runtime-extensions
 | `dreamer`       | Scheduled systemd user timer that reflects on recent sessions and proposes new skills to extract. |
 
 #### Automatic session-title disclosure

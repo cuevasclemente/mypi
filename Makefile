@@ -10,14 +10,21 @@ AGENT_CONTEXT_SOURCE ?= agent-context/AGENTS.md
 AGENT_CONTEXT_BACKUP_DIR ?= $(HOME)/.pi/backups/neutral-agent-context
 MODE ?= copy
 
-PLUGIN_NAMES := $(shell { find plugins -maxdepth 1 -type f -name '*.ts' ! -name '*.test.ts' -printf '%f\n' | sed 's/\.ts$$//'; find plugins -mindepth 2 -maxdepth 2 -type f -name index.ts -printf '%h\n' | sed 's#^plugins/##'; } 2>/dev/null | sort)
+PLUGIN_NAMES := $(shell { find plugins -maxdepth 1 -type f -name '*.ts' ! -name '*.test.ts' ! -iname 'dreamer.ts' -printf '%f\n' | sed 's/\.ts$$//'; find plugins -mindepth 2 -maxdepth 2 -type f -name index.ts ! -ipath 'plugins/dreamer/*' -printf '%h\n' | sed 's#^plugins/##'; } 2>/dev/null | sort)
 SKILL_NAMES := $(shell find skills -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+
+NEUTRAL_PARITY_POLICY ?= deploy/neutral-parity-allowlist.json
+ROLE ?= narwhal
+COMPONENT ?= capabilities
+RELEASE_DIR ?=
+TARGET_ROOT ?=
+BACKUP_ROOT ?=
 PLUGINS ?= $(PLUGIN_NAMES)
 SKILLS ?= $(SKILL_NAMES)
 PROJECT_DIR ?=
 WAYANG_DIR ?= $(HOME)/src/wayang
 
-.PHONY: help list-plugins list-skills install install-all check-identity-neutral user-install install-extensions install-skills install-hooks install-agent-context install-neutral-context install-dreamer-cron install-companion-policy check-companion-policy project-install make-project-install _install-extensions
+.PHONY: help list-plugins list-skills install install-all check-identity-neutral user-install install-extensions install-skills install-hooks install-agent-context install-neutral-context install-dreamer-cron install-companion-policy check-companion-policy project-install make-project-install _install-extensions neutral-parity-plan neutral-parity-build neutral-parity-verify neutral-parity-install-plan neutral-parity-test
 
 help:
 	@printf '%s\n' \
@@ -43,7 +50,17 @@ help:
 	  '  make make-project-install PROJECT_DIR=/path/to/project [PLUGINS="todo hooks"]' \
 	  '      Alias for project-install.' \
 	  '  make list-plugins' \
-	  '      Show plugins discovered under plugins/.' \
+	  '      Show plugins discovered under plugins/ (excludes tests and Dreamer).' \
+	  '  make neutral-parity-plan ROLE=narwhal|sceptre COMPONENT=capabilities|neutral-context' \
+	  '      Print the explicit immutable-manifest plan and candidate classifications.' \
+	  '  make neutral-parity-build ROLE=... COMPONENT=... RELEASE_DIR=/new/path' \
+	  '      Build a deterministic staged payload, manifest, archive, and SHA-256 sidecars.' \
+	  '  make neutral-parity-verify RELEASE_DIR=/path' \
+	  '      Verify staged hashes, sizes, and modes.' \
+	  '  make neutral-parity-install-plan RELEASE_DIR=/path TARGET_ROOT=/isolated/root' \
+	  '      Dry-run only; this Makefile intentionally provides no live apply target.' \
+	  '  make neutral-parity-test' \
+	  '      Run installer tests using synthetic temporary roots only.' \
 	  '' \
 	  'Defaults:' \
 	  '  PLUGINS="$(PLUGIN_NAMES)"' \
@@ -55,6 +72,27 @@ list-plugins:
 
 list-skills:
 	@printf '%s\n' $(SKILL_NAMES)
+
+neutral-parity-plan:
+	@node scripts/neutral-parity.mjs plan --policy '$(NEUTRAL_PARITY_POLICY)' --source . --role '$(ROLE)' --component '$(COMPONENT)'
+
+neutral-parity-build:
+	@if [[ -z '$(RELEASE_DIR)' ]]; then echo 'RELEASE_DIR is required and must be a new path outside the source worktree.' >&2; exit 2; fi
+	@node scripts/neutral-parity.mjs build --policy '$(NEUTRAL_PARITY_POLICY)' --source . --role '$(ROLE)' --component '$(COMPONENT)' --output '$(RELEASE_DIR)'
+
+neutral-parity-verify:
+	@if [[ -z '$(RELEASE_DIR)' ]]; then echo 'RELEASE_DIR is required.' >&2; exit 2; fi
+	@node scripts/neutral-parity.mjs verify --manifest '$(RELEASE_DIR)/manifest.json' --payload '$(RELEASE_DIR)/payload'
+
+neutral-parity-install-plan:
+	@if [[ -z '$(RELEASE_DIR)' ]]; then echo 'RELEASE_DIR is required.' >&2; exit 2; fi
+	@if [[ -z '$(TARGET_ROOT)' ]]; then echo 'TARGET_ROOT is required and should be an isolated temporary root.' >&2; exit 2; fi
+	@args=(install --manifest '$(RELEASE_DIR)/manifest.json' --payload '$(RELEASE_DIR)/payload' --target '$(TARGET_ROOT)'); \
+	if [[ -n '$(BACKUP_ROOT)' ]]; then args+=(--backup-root '$(BACKUP_ROOT)'); fi; \
+	node scripts/neutral-parity.mjs "$${args[@]}"
+
+neutral-parity-test:
+	@node --test tests/neutral-parity.test.mjs
 
 install: user-install
 
