@@ -1,0 +1,39 @@
+{
+  "positive": [
+    ["my Home Assistant YAML automation stopped firing", "home-assistant-automation-troubleshooting"],
+    ["debug an ONVIF RTSP camera in Home Assistant", "home-assistant-camera-troubleshooting"],
+    ["is wildfire smoke safe for outdoor exercise today", "local-air-quality-wildfire-smoke"],
+    ["which treats are safe for a dog with kidney disease and food allergies", "canine-renal-diet-treat-research"],
+    ["my pet may have eaten something poisonous", "pet-urgent-triage-support"],
+    ["early pregnancy bleeding with one-sided pain", "early-pregnancy-urgent-triage-support"],
+    ["fish mercury guidance during pregnancy", "pregnancy-food-safety-research"],
+    ["build a shaving-sensitive retinoid skincare routine", "skincare-routine-product-research"],
+    ["check tire width and rim clearance for my bicycle", "bicycle-tire-fitment-research"],
+    ["choose stove food storage and packing gear for bikepacking", "bikepacking-trip-gear-planning"],
+    ["recommend an e-bike helmet and protective gear", "e-bike-helmet-protective-gear-research"],
+    ["explain Japanese grammar kanji and furigana", "japanese-language-learning-support"],
+    ["plan a local bus and train trip with live arrivals", "local-transit-trip-planning"],
+    ["find a nearby luthier or repair shop", "local-service-provider-research"],
+    ["optimize Qwen llama.cpp inference on local GPU hardware", "local-llm-inference-planning"],
+    ["fix Wayang session deep links and URL routing", "wayang-session-url-routing-development"],
+    ["debug input lag in a very long Wayang chat", "wayang-chat-performance-debugging"],
+    ["configure Pi model providers and defaults", "pi-model-provider-configuration"],
+    ["build Home Assistant sensor dashboard alerts", "home-assistant-dashboard-sensor-alerts"],
+    ["recover and audit Borg server backups", "server-lattice-backup-operations"],
+    ["deploy a Caddy reverse proxy route in server-lattice", "server-lattice-caddyfile-deploy"],
+    ["safe home canning and botulism prevention", "food-preservation-safety-research"],
+    ["is this leftover or purchased food spoiled", "food-spoilage-safety-triage"],
+    ["breakfast timing intermittent fasting and weight goals", "meal-timing-nutrition-research"],
+    ["compare clothing fit and color from photos", "personal-style-fit-advice"]
+  ],
+  "negative": [
+    "write a poem about clouds",
+    "what time is it",
+    "say hello",
+    "calculate 17 times 23",
+    "explain photosynthesis",
+    "tell me a joke",
+    "summarize this paragraph",
+    "help me think through a difficult decision"
+  ]
+}

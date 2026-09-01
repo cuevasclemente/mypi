@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import * as path from "node:path";
 
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -16,29 +17,16 @@ interface BrowserSessionState {
   controlMode: BrowserControlMode;
   needsUser: boolean;
   needsUserReason?: string;
+  lastResumeAt?: number;
   activeUrl?: string;
   activeTitle?: string;
   credentialInspection?: "blocked" | "text-allowed";
 }
 
-interface BrowserHandoffView {
-  handoffId: string;
-  status: "pending" | "completed" | "failed" | "expired" | "cancelled";
-  reason: string;
-  createdAt: number;
-  expiresAt: number;
-  terminalAt?: number;
-  failure?: "resume_failed";
-}
-
-interface BrowserHandoffInspection {
-  active: BrowserHandoffView | null;
-  lastTerminal: BrowserHandoffView | null;
-}
-
 const AGENT_TOKEN_HEADER = "X-Wayang-Browser-Agent-Token";
 const SOURCE_SESSION_HEADER = "X-Wayang-Source-Session-Id";
 const ACTOR_HEADER = "X-Wayang-Browser-Actor";
+const SHARED_PERSISTENCE = "shared";
 
 const FILE_TOOL_NAMES = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 const COMMAND_TOOL_NAMES = new Set(["bash", "sudo_exec", "exec", "shell", "run", "run_command"]);
@@ -64,28 +52,22 @@ function backendBaseUrl(): string {
   return (process.env.WAYANG_URL || process.env.PI_WEB_UI_URL || "http://127.0.0.1:8787").replace(/\/+$/, "");
 }
 
-interface BrowserAgentCapability {
-  readonly sourceSessionId: string;
-  readonly token: string;
+function normalizeCwd(cwd: string): string {
+  return path.resolve(cwd).replace(/\/+$/, "") || "/";
 }
 
 interface BrowserAgentCapabilityBridge {
-  forPiSession(piSessionId: string): BrowserAgentCapability | undefined;
+  forPiSession(piSessionId: string): { sourceSessionId: string; token: string } | undefined;
 }
 
-function resolveCapability(ctx: any): Readonly<BrowserAgentCapability> {
+function requestHeaders(body: unknown, ctx: any): Record<string, string> {
   const piSessionId = ctx?.sessionManager?.getSessionId?.();
   const bridge = (globalThis as typeof globalThis & {
     __wayang_browser_agent_capabilities?: BrowserAgentCapabilityBridge;
   }).__wayang_browser_agent_capabilities;
   const capability = typeof piSessionId === "string" ? bridge?.forPiSession(piSessionId) : undefined;
-  if (!capability || typeof capability.sourceSessionId !== "string" || typeof capability.token !== "string") {
-    throw new Error("Wayang did not provide session-attributed browser authorization");
-  }
-  return Object.freeze({ sourceSessionId: capability.sourceSessionId, token: capability.token });
-}
+  if (!capability) throw new Error("Wayang did not provide session-attributed browser authorization");
 
-function requestHeaders(body: unknown, capability: Readonly<BrowserAgentCapability>): Record<string, string> {
   const headers: Record<string, string> = {
     [ACTOR_HEADER]: "agent",
     [AGENT_TOKEN_HEADER]: capability.token,
@@ -95,11 +77,11 @@ function requestHeaders(body: unknown, capability: Readonly<BrowserAgentCapabili
   return headers;
 }
 
-async function apiRequest<T>(method: string, operation: string, body: unknown, signal: AbortSignal | undefined, capability: Readonly<BrowserAgentCapability>): Promise<T> {
-  const res = await fetch(`${backendBaseUrl()}/api/browser/agent/${operation}`, {
+async function apiRequest<T>(method: string, apiPath: string, body: unknown, signal: AbortSignal | undefined, ctx: any): Promise<T> {
+  const res = await fetch(`${backendBaseUrl()}${apiPath}`, {
     method,
     signal,
-    headers: requestHeaders(body, capability),
+    headers: requestHeaders(body, ctx),
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -156,6 +138,12 @@ function toolFailure(toolName: string, err: unknown): ToolResult {
   }
   const message = err instanceof Error ? err.message : String(err);
   return result(`${toolName} failed: ${message}`, { error: message });
+}
+
+function browserBody(projectCwd: string, extra?: Record<string, unknown>): Record<string, unknown> {
+  // The default lookup intentionally resolves to Wayang's single shared browser.
+  // projectCwd remains attribution/context, not a profile key.
+  return { projectCwd, persistence: SHARED_PERSISTENCE, ...extra };
 }
 
 function summarizeCredentialInspection(state: BrowserSessionState): string | undefined {
@@ -287,7 +275,9 @@ export default function browserControl(pi: ExtensionAPI) {
     name: "browser_status",
     label: "Browser Status",
     description: "Return the public state of Wayang's shared embedded browser workbench.",
-    parameters: Type.Object({}),
+    parameters: Type.Object({
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
+    }),
     promptSnippet: "Inspect the shared Wayang embedded Chromium browser state.",
     promptGuidelines: [
       "Use browser_status before browser automation when you need to know whether Chromium is already running or waiting for user control.",
@@ -295,8 +285,9 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "status", {}, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const query = new URLSearchParams({ project_cwd: projectCwd, persistence: SHARED_PERSISTENCE });
+        const state = await apiRequest<BrowserSessionState>("GET", `/api/browser/status?${query.toString()}`, undefined, signal, ctx);
         return result(`Browser status: ${summarizeState(state)}`, { state });
       } catch (err: any) {
         return toolFailure("browser_status", err);
@@ -310,6 +301,7 @@ export default function browserControl(pi: ExtensionAPI) {
     description: "Start Wayang's shared embedded Chromium browser, optionally navigating to a URL.",
     parameters: Type.Object({
       url: Type.Optional(Type.String({ description: "Optional URL to navigate to after startup" })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptSnippet: "Start the shared Wayang embedded Chromium browser.",
     promptGuidelines: [
@@ -318,11 +310,10 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        // Capture one exact source/runtime lease for the whole start+navigate call.
-        const capability = resolveCapability(ctx);
-        let state = await apiRequest<BrowserSessionState>("POST", "start", {}, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        let state = await apiRequest<BrowserSessionState>("POST", "/api/browser/start", browserBody(projectCwd), signal, ctx);
         if (params.url) {
-          state = await apiRequest<BrowserSessionState>("POST", "navigate", { url: params.url }, signal, capability);
+          state = await apiRequest<BrowserSessionState>("POST", "/api/browser/navigate", browserBody(projectCwd, { url: params.url }), signal, ctx);
         }
         return result(`Browser open: ${summarizeState(state)}. Open the Wayang Browser tab to watch or interact.`, { state });
       } catch (err: any) {
@@ -337,11 +328,12 @@ export default function browserControl(pi: ExtensionAPI) {
     description: "Navigate the shared Wayang embedded browser to a URL.",
     parameters: Type.Object({
       url: Type.String({ description: "URL to navigate to" }),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "navigate", { url: params.url }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const state = await apiRequest<BrowserSessionState>("POST", "/api/browser/navigate", browserBody(projectCwd, { url: params.url }), signal, ctx);
         return result(`Navigated browser: ${summarizeState(state)}`, { state });
       } catch (err: any) {
         return toolFailure("browser_navigate", err);
@@ -355,6 +347,7 @@ export default function browserControl(pi: ExtensionAPI) {
     description: "Read the current page title/url and visible text or screenshot from the embedded browser.",
     parameters: Type.Object({
       mode: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("screenshot")], { description: "Snapshot mode. Default: text" })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptSnippet: "Inspect current embedded browser page text or screenshot.",
     promptGuidelines: [
@@ -363,8 +356,8 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const snapshot = await apiRequest<any>("POST", "snapshot", { mode: params.mode || "text" }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const snapshot = await apiRequest<any>("POST", "/api/browser/snapshot", browserBody(projectCwd, { mode: params.mode || "text" }), signal, ctx);
         const text = params.mode === "screenshot"
           ? `Browser screenshot captured for ${snapshot.title || snapshot.url || "current page"}.`
           : `Browser snapshot: ${snapshot.title || "(untitled)"}\n${snapshot.url || ""}\n\n${String(snapshot.text || "").slice(0, 4000)}`;
@@ -382,6 +375,7 @@ export default function browserControl(pi: ExtensionAPI) {
     parameters: Type.Object({
       includeText: Type.Optional(Type.Boolean({ description: "Also include document.body.innerText. Default false." })),
       limit: Type.Optional(Type.Number({ description: "Maximum number of elements to return. Default 80, max 300." })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptSnippet: "Inspect a page structurally through Chromium CDP instead of relying on screenshots.",
     promptGuidelines: [
@@ -390,8 +384,8 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const snapshot = await apiRequest<any>("POST", "dom-snapshot", { includeText: Boolean(params.includeText), limit: params.limit }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const snapshot = await apiRequest<any>("POST", "/api/browser/dom-snapshot", browserBody(projectCwd, { includeText: Boolean(params.includeText), limit: params.limit }), signal, ctx);
         const text = `Browser DOM snapshot: ${snapshot.title || "(untitled)"}\n${snapshot.url || ""}\n\n${summarizeElements(snapshot.elements)}${params.includeText ? `\n\nPage text:\n${String(snapshot.text || "").slice(0, 4000)}` : ""}`;
         return result(text, { snapshot, warning: "Page contents/selectors may be sensitive and are now in tool output." });
       } catch (err: any) {
@@ -407,11 +401,12 @@ export default function browserControl(pi: ExtensionAPI) {
     parameters: Type.Object({
       selector: Type.String({ description: "CSS selector to query" }),
       limit: Type.Optional(Type.Number({ description: "Maximum matches. Default 25, max 200." })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const query = await apiRequest<any>("POST", "query-selector", { selector: params.selector, limit: params.limit }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const query = await apiRequest<any>("POST", "/api/browser/query-selector", browserBody(projectCwd, { selector: params.selector, limit: params.limit }), signal, ctx);
         return result(`Selector ${JSON.stringify(params.selector)} matched ${query.elements?.length || 0} element(s):\n${summarizeElements(query.elements)}`, { query });
       } catch (err: any) {
         return toolFailure("browser_query_selector", err);
@@ -426,6 +421,7 @@ export default function browserControl(pi: ExtensionAPI) {
     parameters: Type.Object({
       selector: Type.String({ description: "CSS selector to click" }),
       index: Type.Optional(Type.Number({ description: "Zero-based match index. Default 0." })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptGuidelines: [
       "Use selectors from browser_dom_snapshot or browser_query_selector when possible.",
@@ -433,8 +429,8 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "click-selector", { selector: params.selector, index: params.index ?? 0 }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const state = await apiRequest<BrowserSessionState>("POST", "/api/browser/click-selector", browserBody(projectCwd, { selector: params.selector, index: params.index ?? 0 }), signal, ctx);
         return result(`Clicked selector ${JSON.stringify(params.selector)} index ${params.index ?? 0}: ${summarizeState(state)}`, { state });
       } catch (err: any) {
         return toolFailure("browser_click_selector", err);
@@ -450,6 +446,7 @@ export default function browserControl(pi: ExtensionAPI) {
       selector: Type.String({ description: "CSS selector for the field to fill" }),
       text: Type.String({ description: "Non-secret public text to fill" }),
       index: Type.Optional(Type.Number({ description: "Zero-based match index. Default 0." })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptGuidelines: [
       "Only fill non-secret public text. For credentials, MFA, CAPTCHA, payment details, SSNs, or other secrets, use browser_wait_for_user.",
@@ -457,8 +454,8 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "fill-selector", { selector: params.selector, text: params.text, index: params.index ?? 0 }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const state = await apiRequest<BrowserSessionState>("POST", "/api/browser/fill-selector", browserBody(projectCwd, { selector: params.selector, text: params.text, index: params.index ?? 0 }), signal, ctx);
         return result(`Filled selector ${JSON.stringify(params.selector)} index ${params.index ?? 0}: ${summarizeState(state)}`, { state });
       } catch (err: any) {
         return toolFailure("browser_fill_selector", err);
@@ -472,11 +469,12 @@ export default function browserControl(pi: ExtensionAPI) {
     description: "Extract links and generated selectors from the current embedded browser page through Chromium CDP.",
     parameters: Type.Object({
       limit: Type.Optional(Type.Number({ description: "Maximum links. Default 100, max 500." })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const links = await apiRequest<any>("POST", "links", { limit: params.limit }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const links = await apiRequest<any>("POST", "/api/browser/links", browserBody(projectCwd, { limit: params.limit }), signal, ctx);
         return result(`Browser links: ${links.title || "(untitled)"}\n${links.url || ""}\n\n${summarizeLinks(links.links)}`, { links });
       } catch (err: any) {
         return toolFailure("browser_extract_links", err);
@@ -490,6 +488,7 @@ export default function browserControl(pi: ExtensionAPI) {
     description: "Read a simplified Chromium accessibility tree for the current page, useful for identifying semantic controls without visual inspection.",
     parameters: Type.Object({
       limit: Type.Optional(Type.Number({ description: "Maximum accessibility nodes. Default 120, max 500." })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptGuidelines: [
       "Use this when DOM selectors are unclear or the page relies on ARIA roles.",
@@ -497,8 +496,8 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const ax = await apiRequest<any>("POST", "accessibility", { limit: params.limit }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const ax = await apiRequest<any>("POST", "/api/browser/accessibility", browserBody(projectCwd, { limit: params.limit }), signal, ctx);
         const nodes = Array.isArray(ax.nodes) ? ax.nodes : [];
         const summary = nodes.slice(0, 80).map((node: any, index: number) => `#${index} ${node.role || "node"} ${node.name ? JSON.stringify(String(node.name).slice(0, 160)) : ""}${node.value ? ` value=${JSON.stringify(String(node.value).slice(0, 80))}` : ""}`).join("\n") || "(no accessibility nodes)";
         return result(`Browser accessibility snapshot: ${ax.title || "(untitled)"}\n${ax.url || ""}\n\n${summary}`, { accessibility: ax, warning: "Accessibility text may include sensitive page contents." });
@@ -515,11 +514,12 @@ export default function browserControl(pi: ExtensionAPI) {
     parameters: Type.Object({
       x: Type.Number({ description: "Viewport x coordinate" }),
       y: Type.Number({ description: "Viewport y coordinate" }),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "click", { x: params.x, y: params.y }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const state = await apiRequest<BrowserSessionState>("POST", "/api/browser/click", browserBody(projectCwd, { x: params.x, y: params.y }), signal, ctx);
         return result(`Clicked browser at ${params.x},${params.y}.`, { state });
       } catch (err: any) {
         return toolFailure("browser_click", err);
@@ -533,6 +533,7 @@ export default function browserControl(pi: ExtensionAPI) {
     description: "Type non-secret public text into the focused embedded-browser field. Do not use for passwords, TOTP, payment details, or private secrets.",
     parameters: Type.Object({
       text: Type.String({ description: "Non-secret text to type" }),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptSnippet: "Type non-secret text into the embedded browser.",
     promptGuidelines: [
@@ -541,8 +542,8 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "type-public", { text: params.text }, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const state = await apiRequest<BrowserSessionState>("POST", "/api/browser/type-public", browserBody(projectCwd, { text: params.text }), signal, ctx);
         return result(`Typed public text into browser.`, { state });
       } catch (err: any) {
         return toolFailure("browser_type_public", err);
@@ -557,6 +558,7 @@ export default function browserControl(pi: ExtensionAPI) {
     parameters: Type.Object({
       reason: Type.String({ description: "What the user should handle before resuming" }),
       timeoutMs: Type.Optional(Type.Number({ description: "How long to wait for resume; default 10 minutes" })),
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
     }),
     promptSnippet: "Pause browser automation until the user resumes from the Browser tab.",
     promptGuidelines: [
@@ -565,43 +567,21 @@ export default function browserControl(pi: ExtensionAPI) {
     ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        // Keep one exact lease and one exact handoff ID for the entire wait.
-        const capability = resolveCapability(ctx);
-        const timeoutMs = Math.min(60 * 60 * 1000, Math.max(1_000, Math.floor(Number(params.timeoutMs) || 10 * 60 * 1000)));
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
         const startedAt = Date.now();
-        const created = await apiRequest<{ handoff: BrowserHandoffView; state: BrowserSessionState }>(
-          "POST",
-          "handoff",
-          { reason: params.reason, timeoutMs },
-          signal,
-          capability,
-        );
-        const handoffId = created.handoff.handoffId;
-        let latest = created;
+        await apiRequest<BrowserSessionState>("POST", "/api/browser/control-mode", browserBody(projectCwd, { mode: "paused", reason: params.reason }), signal, ctx);
+        const timeoutMs = Math.max(1_000, Number(params.timeoutMs) || 10 * 60 * 1000);
         while (Date.now() - startedAt < timeoutMs) {
           await sleep(1_000, signal);
-          latest = await apiRequest<{ handoff: BrowserHandoffView; state: BrowserSessionState }>(
-            "POST",
-            "handoff-status",
-            { handoffId },
-            signal,
-            capability,
-          );
-          if (latest.handoff.status === "completed") {
-            return result(`User returned browser control: ${summarizeState(latest.state)}`, { ...latest, resumed: true });
-          }
-          if (latest.handoff.status !== "pending") {
-            return result(`Browser handoff ended with status=${latest.handoff.status}; human control remains active.`, { ...latest, resumed: false });
+          const query = new URLSearchParams({ project_cwd: projectCwd, persistence: SHARED_PERSISTENCE });
+          const state = await apiRequest<BrowserSessionState>("GET", `/api/browser/status?${query.toString()}`, undefined, signal, ctx);
+          if (state.controlMode === "agent" && (state.lastResumeAt || 0) >= startedAt) {
+            return result(`User resumed browser automation: ${summarizeState(state)}`, { state, resumed: true });
           }
         }
-        latest = await apiRequest<{ handoff: BrowserHandoffView; state: BrowserSessionState }>(
-          "POST",
-          "handoff-status",
-          { handoffId },
-          signal,
-          capability,
-        );
-        return result(`Still in human control after ${Math.round(timeoutMs / 1000)}s. Open the Browser tab to review the exact handoff; timeout never returns control automatically.`, { ...latest, resumed: false });
+        const query = new URLSearchParams({ project_cwd: projectCwd, persistence: SHARED_PERSISTENCE });
+        const state = await apiRequest<BrowserSessionState>("GET", `/api/browser/status?${query.toString()}`, undefined, signal, ctx);
+        return result(`Still waiting for user after ${Math.round(timeoutMs / 1000)}s. Ask Clemente to open the Browser tab and click Resume agent when ready.`, { state, resumed: false });
       } catch (err: any) {
         return toolFailure("browser_wait_for_user", err);
       }
@@ -612,20 +592,15 @@ export default function browserControl(pi: ExtensionAPI) {
     name: "browser_resume_status",
     label: "Browser Resume Status",
     description: "Check whether the Browser tab has resumed agent control after a user handoff.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+    parameters: Type.Object({
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const response = await apiRequest<{ handoff: BrowserHandoffInspection; state: BrowserSessionState }>(
-          "POST",
-          "handoff-status",
-          {},
-          signal,
-          capability,
-        );
-        const resumed = response.handoff.active === null && response.handoff.lastTerminal?.status === "completed";
-        const exact = response.handoff.active ?? response.handoff.lastTerminal;
-        return result(`Browser resume status: ${exact ? `handoff=${exact.status}; ` : "no exact handoff; "}${summarizeState(response.state)}`, { ...response, resumed });
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const query = new URLSearchParams({ project_cwd: projectCwd, persistence: SHARED_PERSISTENCE });
+        const state = await apiRequest<BrowserSessionState>("GET", `/api/browser/status?${query.toString()}`, undefined, signal, ctx);
+        return result(`Browser resume status: ${summarizeState(state)}`, { state, resumed: state.controlMode === "agent" });
       } catch (err: any) {
         return toolFailure("browser_resume_status", err);
       }
@@ -636,11 +611,13 @@ export default function browserControl(pi: ExtensionAPI) {
     name: "browser_close",
     label: "Close Browser",
     description: "Stop the shared Wayang embedded Chromium browser process without deleting its persistent profile.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+    parameters: Type.Object({
+      projectCwd: Type.Optional(Type.String({ description: "Project cwd. Defaults to current agent cwd." })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const capability = resolveCapability(ctx);
-        const state = await apiRequest<BrowserSessionState>("POST", "stop", {}, signal, capability);
+        const projectCwd = normalizeCwd(params.projectCwd || ctx.cwd);
+        const state = await apiRequest<BrowserSessionState>("POST", "/api/browser/stop", browserBody(projectCwd), signal, ctx);
         return result(`Browser closed: ${summarizeState(state)}`, { state });
       } catch (err: any) {
         return toolFailure("browser_close", err);

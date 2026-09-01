@@ -89,26 +89,6 @@ interface UsageData {
 	};
 }
 
-interface UsageMessage {
-	role: "assistant";
-	content: Array<{ type: string }>;
-	usage?: {
-		input?: number;
-		output?: number;
-		cacheRead?: number;
-		cacheWrite?: number;
-		totalTokens?: number;
-		cost?: {
-			input?: number;
-			output?: number;
-			cacheRead?: number;
-			cacheWrite?: number;
-			total?: number;
-		};
-	};
-	[key: string]: unknown;
-}
-
 // ── Data Management ─────────────────────────────────────────────────────────
 
 function ensureDir(): void {
@@ -175,36 +155,11 @@ function ensureModel(providerData: ProviderUsage, model: string): ModelUsage {
 	return providerData[model];
 }
 
-function addUsage(day: DailyUsage, date: string, provider: string, model: string, usage: ModelUsage): void {
-	ensureDir();
-	const data = loadUsage();
-
-	if (!data.daily[date]) data.daily[date] = {};
-	const dayData = data.daily[date];
-	const prov = ensureProvider(dayData, provider);
-	const existing = ensureModel(prov, model);
-
-	existing.input += usage.input;
-	existing.output += usage.output;
-	existing.cacheRead += usage.cacheRead;
-	existing.cacheWrite += usage.cacheWrite;
-	existing.totalTokens += usage.totalTokens;
-	existing.cost.input += usage.cost.input;
-	existing.cost.output += usage.cost.output;
-	existing.cost.cacheRead += usage.cost.cacheRead;
-	existing.cost.cacheWrite += usage.cost.cacheWrite;
-	existing.cost.total += usage.cost.total;
-	existing.requests += usage.requests;
-
-	saveUsage(data);
-}
-
 // ── Message Extraction ──────────────────────────────────────────────────────
 
 function extractUsageFromMessage(
 	message: Record<string, unknown>,
 ): { provider: string; modelId: string; usage: ModelUsage } | null {
-	// Check for provider/model at message level (pi coding agent pattern)
 	const provider = typeof message.provider === "string" ? message.provider : null;
 	const model = typeof message.model === "string" ? message.model : null;
 	const usageRaw = (message as Record<string, unknown>).usage as
@@ -303,7 +258,7 @@ function scanSessions(): { processed: number; newEntries: number; errors: number
 						const extracted = extractUsageFromMessage(msg);
 						if (!extracted) continue;
 
-						// Add to in-memory data directly (avoids re-reading the file)
+						// Add to in-memory data directly
 						if (!data.daily[sessionDate]) data.daily[sessionDate] = {};
 						const dayData = data.daily[sessionDate];
 						const prov = ensureProvider(dayData, extracted.provider);
@@ -564,11 +519,9 @@ function renderTuiReport(
 	if (report.lines.length === 0) {
 		out.push(theme.fg("muted", "  No token usage data for this period."));
 	} else {
-		// Column widths
 		const nameW = 30;
 		const numW = 10;
 
-		// Header
 		const hdr =
 			"Provider/Model".padEnd(nameW) +
 			"Input".padStart(numW) +
@@ -596,7 +549,6 @@ function renderTuiReport(
 			);
 		}
 
-		// Totals
 		out.push(theme.fg("dim", `  ${"─".repeat(hdr.length)}`));
 		out.push(
 			`  ${theme.fg("accent", theme.bold("TOTAL".padEnd(nameW)))}` +
@@ -609,7 +561,6 @@ function renderTuiReport(
 				`${theme.fg("accent", theme.bold(String(report.totals.requests).padStart(5)))}`,
 		);
 
-		// Show daily breakdown if multiple days
 		if (Object.keys(report.dailyData).length > 1) {
 			out.push("");
 			out.push(theme.fg("dim", "  Daily breakdown:"));
@@ -677,10 +628,10 @@ export default function (pi: ExtensionAPI) {
 				let report: Report;
 				switch (sub) {
 					case "scan":
-						const result = scanSessions();
-						console.log(`Scanned ${result.processed} session files.`);
-						console.log(`Added ${result.newEntries} new usage entries.`);
-						if (result.errors > 0) console.log(`${result.errors} errors.`);
+						const scanResult = scanSessions();
+						console.log(`Scanned ${scanResult.processed} session files.`);
+						console.log(`Added ${scanResult.newEntries} new usage entries.`);
+						if (scanResult.errors > 0) console.log(`${scanResult.errors} errors.`);
 						return;
 					case "all":
 						report = collectReport(allDays());
@@ -826,8 +777,6 @@ export default function (pi: ExtensionAPI) {
 		const data = loadUsage();
 		const totalDays = Object.keys(data.daily).length;
 		if (ctx.hasUI && totalDays > 0) {
-			// Don't spam — only notify if there's existing data
-
 			// Count today's tokens
 			const today = todayKey();
 			const todayData = data.daily[today];

@@ -62,7 +62,7 @@ For every scheduled or ad-hoc Public portfolio workflow, follow `portfolio-state
 
 Public is always authoritative for live holdings, cash, orders, and fills. Before canonical cutover, the handoff/tasks remain authoritative policy and the ledgers are shadow state. After a valid cutover, the Markdown ledgers govern proposals, decisions, reservations, budgets, and agent authorization. Any brokerage/ledger discrepancy suspends new entries until reconciled.
 
-The approved **future** bounded-autonomy envelope is documented now for shadow validation, not live use:
+The approved bounded-autonomy envelope is:
 
 - eligible instruments: stocks/ETFs, buy-to-open long calls/puts, and atomically submitted genuinely defined-risk spreads;
 - maximum autonomous purchase cost or defined maximum loss: exactly **$3,000.00 per thesis**;
@@ -75,6 +75,33 @@ The approved **future** bounded-autonomy envelope is documented now for shadow v
 These bounds confer **no authority while disabled**. Live bounded autonomy requires all release tests, canonical cutover, `autonomous_entries_enabled: true`, and Clemente's authenticated approval of the exact enabled `AUTONOMY.md` bytes/hash/version. Never infer approval from the plan, a prior discussion, a limit value, or an unanswered decision.
 
 Every run advances existing stable-ID proposals and decisions before creating a new candidate. No proposal or blocking decision may silently disappear. An unanswered decision preserves the current state; expiry triggers re-evaluation, never implicit approval.
+
+## Staged-Probe Anti-Paralysis Procedure
+
+When deployment research mode or repeated-no-trade evidence applies, convert a research-qualified thesis into governable exposure rather than stacking marginal confirmations indefinitely:
+
+- Default the first autonomous entry for a new thesis to at most **$1,000.00 purchase cost or defined maximum loss**, inside the unchanged exact $3,000 thesis cap. This is a sizing default, not order authority or an obligation to trade.
+- Designate one primary measurable market/event confirmation, at most one distinct thesis-breaking contradiction veto, and one instrument-economics/liquidity confirmation. Correlated price, VWAP, close-count, relative-strength, breadth, volume, rates, dollar, credit, and commodity observations are context/sizing unless each measures a named distinct failure mode.
+- Move a complete packet to `READY` before its catalyst. `READY` means the preferred probe, numeric gates, invalidation, time stop, profit defense, and up to two bounded alternatives are specified; it is not `ARMED`, authority, or canonical `PREPARED` state.
+- Prewrite the fallback ladder—preferred simple option/instrument, intentional spread or different strike/expiry/size, then equity/ETF or liquid proxy. Only one expression may be selected and normalized at `ARMED`; alternatives do not authorize multiple orders.
+- A later add must keep the same immutable thesis ID, use a separately updated or linked proposal and full gateway lifecycle, pass fresh reconciliation/evidence/liquidity/preflight, and remain inside aggregate thesis and daily caps.
+- Under high cash, name one primary quantified research/market blocker when declining the deployment leader. Keep safety, authority, state, budget, liquidity, and gateway failures separate; never weaken those deterministic controls.
+
+The complete operational procedure and lifecycle semantics live in `trading/tasks/portfolio-research-operating-rules.md` and `trading/portfolio-state/README.md`.
+
+## Approved Allocation Policy and Throughput Pilot
+
+Clemente approved on 2026-08-13:
+
+- a **40% NAV broad-US equity beta floor** measured from reconciled market value of unlevered broad-US index ETFs classified `CORE_BROAD_MARKET`;
+- a **15% NAV maximum open option premium/defined-loss sleeve**, including nonterminal option reservations; and
+- a staged transition plus ten-workflow throughput pilot.
+
+The policy is not an exact order and does not alter the exact enabled `AUTONOMY.md`. A floor breach may prioritize a `READY` core proposal but does not alone satisfy the exact `ARMED` trigger gate or bypass the cumulative $3,000 autonomous thesis cap. Default each core tranche to at most $1,000, submit at most one per U.S. trading day, and retain one immutable core thesis across adds. After $3,000 cumulative autonomous acquisition risk, any remaining floor gap requires separately approved exact orders; never relabel tranches to reset the cap.
+
+The 15% option sleeve is a ceiling, not a target. Count original acquisition cost/defined-loss basis allocated to open quantity without netting realized proceeds, plus canonical remaining risk for nonterminal opening/add reservations without double counting fills or replacements. A passive breach blocks new option entries/adds but does not force liquidation solely because NAV moved. This ceiling is not yet encoded in exact `AUTONOMY.md` v2 or independently gateway-enforced: calculate it explicitly and fail closed before new option risk. An exact order approval does not waive it without an explicit quantified, expiring policy exception.
+
+During the active pilot, maintain at most one fully developed deployment leader and at most one backup (`Leader: NONE / RESEARCH_UNQUALIFIED` is valid), permit at most one risk-active `TACTICAL_OPTION` thesis from first reservation until terminal risk, and require `option_role: TACTICAL_OPTION | CORE_DIRECTIONAL_OPTION | HEDGE_OPTION` before any option opening/add reservation. Remove numerical candidate/packet/contingency quotas and record one earliest blocker. Load and update `trading/plans/2026-08-13-portfolio-throughput-pilot-and-allocation-policy.md` using the immutable run-key/idempotency rules there. All authority, reconciliation, liquidity, preflight, reservation, gateway, no-naked-options, daily, and one-new-thesis controls remain unchanged.
 
 ## Environment Setup
 

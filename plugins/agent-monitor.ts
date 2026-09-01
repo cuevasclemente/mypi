@@ -2,7 +2,7 @@
  * Agent Monitor Extension
  *
  * A lightweight monitor that watches the main agent's output using a cheap/fast
- * model (often GPT-5.6 Luna for ChatGPT-backed setups). At the end of each agent turn, it
+ * model (default: DeepSeek V4 Flash). At the end of each agent turn, it
  * evaluates whether the work completed is significant enough to warrant
  * journaling, updating memoriki, or other follow-up actions.
  *
@@ -32,7 +32,7 @@ import * as path from "node:path";
 
 interface MonitorDefinition {
 	name: string;
-	/** Model spec like "openai-codex/gpt-5.6-luna", "deepseek/deepseek-v4-flash", or "openai/gpt-4o-mini" */
+	/** Model spec like "deepseek/deepseek-v4-flash" or "openai/gpt-4o-mini" */
 	model: string;
 	/** Prompt sent to the monitor model. Should instruct it to output JSON with at least {triggered: boolean, reason: string}. */
 	prompt: string;
