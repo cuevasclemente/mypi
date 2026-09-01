@@ -47,6 +47,41 @@ const PROVIDER_GUARD_FALLBACKS: Record<string, string[]> = {
 };
 const RECENT_USER_TURNS = Number.parseInt(process.env.PI_COMMAND_GUARD_USER_TURNS ?? "4", 10);
 const MAX_SECTION_CHARS = Number.parseInt(process.env.PI_COMMAND_GUARD_MAX_SECTION_CHARS ?? "6000", 10);
+
+/**
+ * Verdict-call token and reasoning budgets. The old 512-token budget starved
+ * thinking models (stopReason=length with thinking-only content) before any
+ * verdict text could be emitted. The default keeps bounded reasoning and a
+ * comfortable verdict budget; both are environment-overridable (call-time).
+ */
+function positiveIntEnv(name: string, fallback: number): number {
+	const parsed = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+function guardReasoningLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" {
+	const raw = (process.env.PI_COMMAND_GUARD_REASONING ?? "low").trim().toLowerCase();
+	if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(raw)) return raw as any;
+	return "low";
+}
+function guardVerdictMaxTokens(): number {
+	return positiveIntEnv("PI_COMMAND_GUARD_MAX_TOKENS", 4096);
+}
+function guardVerdictReasoning(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" {
+	return guardReasoningLevel();
+}
+export function guardVerdictBudgets(): { maxTokens: number; reasoning: string } {
+	return { maxTokens: guardVerdictMaxTokens(), reasoning: guardVerdictReasoning() };
+}
+function guardBreakerThreshold(): number {
+	return positiveIntEnv("PI_COMMAND_GUARD_BREAKER_THRESHOLD", 3);
+}
+function guardBreakerCooldownMs(): number {
+	return positiveIntEnv("PI_COMMAND_GUARD_BREAKER_COOLDOWN_MS", 10 * 60 * 1000);
+}
+function guardApprovalTimeoutMs(): number {
+	return positiveIntEnv("PI_COMMAND_GUARD_APPROVAL_TIMEOUT_MS", 120_000);
+}
+
 const VERDICT_HISTORY_LIMIT = 20;
 const WAYANG_FORM_AUTH_MAX_AGE_MS = 10 * 60 * 1000;
 const COMMAND_GUARD_IDENTITY_PIN_FILENAME = "command-guard-identity-pin";
@@ -99,6 +134,20 @@ interface WebCommandGuardIdentityBridge {
 		timeoutMs?: number,
 		options?: { command?: string; reason?: string },
 	): Promise<string | null>;
+}
+
+/**
+ * Wayang backend bridge for asking the owning human to approve a command when
+ * the guard model cannot produce a verdict. Returns true (approved), false
+ * (denied), or null (unavailable/timeout). Mirrors the identity-PIN bridge.
+ */
+interface WebCommandGuardApprovalBridge {
+	requestCommandApproval(
+		sessionId: string,
+		prompt: string,
+		timeoutMs?: number,
+		options?: { command?: string; reason?: string },
+	): Promise<boolean | null>;
 }
 
 interface VerifiedWayangFormEvidence {
@@ -196,6 +245,11 @@ function getWebCommandGuardSessionId(ctx: ExtensionContext): string | null {
 
 function getWebCommandGuardIdentityBridge(): WebCommandGuardIdentityBridge | null {
 	return ((globalThis as any).__pi_command_guard_identity_bridge as WebCommandGuardIdentityBridge | undefined) ?? null;
+}
+
+function getWebCommandGuardApprovalBridge(): WebCommandGuardApprovalBridge | null {
+	const bridge = (globalThis as any).__pi_command_guard_approval_bridge as WebCommandGuardApprovalBridge | undefined;
+	return bridge && typeof bridge.requestCommandApproval === "function" ? bridge : null;
 }
 
 function getWayangHumanInputAuthority(): WayangHumanInputAuthority | null {
@@ -2145,16 +2199,78 @@ ${humanInputs}
 </recent_human_inputs>`;
 }
 
+/**
+ * Consecutive guard-model failure tracking. After GUARD_BREAKER_THRESHOLD
+ * consecutive failures the circuit opens for GUARD_BREAKER_COOLDOWN_MS and
+ * verdict calls skip the model entirely, routing straight to human approval.
+ * Module-level (per pi process): session churn resets overrides but not this.
+ */
+const guardModelHealth = { consecutiveFailures: 0, openUntil: 0 };
+
+export function resetGuardModelHealth(): void {
+	guardModelHealth.consecutiveFailures = 0;
+	guardModelHealth.openUntil = 0;
+}
+
+export function guardModelHealthSnapshot(): { consecutiveFailures: number; breakerOpen: boolean; openUntil: number } {
+	return {
+		consecutiveFailures: guardModelHealth.consecutiveFailures,
+		breakerOpen: Date.now() < guardModelHealth.openUntil,
+		openUntil: guardModelHealth.openUntil,
+	};
+}
+
+function noteGuardModelSuccess(): void {
+	guardModelHealth.consecutiveFailures = 0;
+}
+
+function noteGuardModelFailure(): void {
+	guardModelHealth.consecutiveFailures += 1;
+	if (guardModelHealth.consecutiveFailures >= guardBreakerThreshold()) {
+		guardModelHealth.openUntil = Date.now() + guardBreakerCooldownMs();
+	}
+}
+
+/**
+ * Test/Wayang-debug seam for the verdict model call. The globalThis override is
+ * honored only when PI_COMMAND_GUARD_TEST_COMPLETER=1 is explicitly set in the
+ * pi process environment; production sessions never see it. The agent cannot
+ * mutate the pi process environment from bash commands.
+ */
+function guardComplete(model: any, context: any, options: any): Promise<any> {
+	if (process.env.PI_COMMAND_GUARD_TEST_COMPLETER === "1") {
+		const override = (globalThis as any).__pi_command_guard_model_completer as ((m: any, c: any, o: any) => Promise<any>) | undefined;
+		if (typeof override === "function") return override(model, context, options);
+	}
+	return complete(model, context, options);
+}
+
 export async function evaluateCommand(
 	command: string,
 	input: Record<string, unknown>,
 	ctx: ExtensionContext,
-): Promise<{ verdict: Verdict; model: string }> {
+): Promise<{ verdict: Verdict; model: string; modelFailure?: boolean }> {
 	const candidates = findMonitorModels(ctx);
 	if (candidates.length === 0) {
+		noteGuardModelFailure();
 		return {
 			model: "unavailable",
 			verdict: { allow: false, reason: "Command guard model unavailable", risk: "high", authorization: "none" },
+			modelFailure: true,
+		};
+	}
+
+	if (Date.now() < guardModelHealth.openUntil) {
+		const cooldownSeconds = Math.max(1, Math.ceil((guardModelHealth.openUntil - Date.now()) / 1000));
+		return {
+			model: "circuit-breaker",
+			verdict: {
+				allow: false,
+				reason: `Command guard model circuit breaker open (${guardModelHealth.consecutiveFailures} consecutive failures; ~${cooldownSeconds}s cooldown remaining)`,
+				risk: "high",
+				authorization: "none",
+			},
+			modelFailure: true,
 		};
 	}
 
@@ -2170,11 +2286,13 @@ export async function evaluateCommand(
 			auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as any);
 		} catch (err) {
 			failures.push(`${modelName}: auth failed: ${(err as Error).message}`);
+			noteGuardModelFailure();
 			continue;
 		}
 
 		if (!auth?.ok || !auth.apiKey) {
 			failures.push(`${modelName}: no API key available`);
+			noteGuardModelFailure();
 			continue;
 		}
 
@@ -2183,7 +2301,11 @@ export async function evaluateCommand(
 				apiKey: auth.apiKey,
 				headers: auth.headers,
 				env: auth.env,
-				maxTokens: 512,
+				// Verdict budget: bounded reasoning plus room for the verdict text.
+				maxTokens: guardVerdictMaxTokens(),
+				// Hard-cap the thinking level so the guard keeps (limited) reasoning
+				// without letting it starve the verdict (stopReason=length).
+				reasoning: guardVerdictReasoning(),
 				signal: ctx.signal,
 			};
 			// Some providers/models (notably Codex-backed accounts) reject an
@@ -2193,7 +2315,7 @@ export async function evaluateCommand(
 				completionOptions.temperature = (model as any).provider === "together" ? 1 : 0;
 			}
 
-			const response = await complete(
+			const response = await guardComplete(
 				model as any,
 				{
 					systemPrompt: SYSTEM_PROMPT,
@@ -2217,13 +2339,18 @@ export async function evaluateCommand(
 				.map((c) => c.thinking)
 				.join("\n");
 			const verdict = parseLooseVerdict(text) ?? parseLooseVerdict(thinking);
-			if (verdict) return { model: modelName, verdict };
+			if (verdict) {
+				noteGuardModelSuccess();
+				return { model: modelName, verdict };
+			}
 
 			const contentTypes = response.content.map((c) => c.type).join(",") || "none";
 			const errorMessage = typeof (response as any).errorMessage === "string" ? `, error=${(response as any).errorMessage}` : "";
 			failures.push(`${modelName}: unparsable verdict (stopReason=${response.stopReason}, contentTypes=${contentTypes}${errorMessage})`);
+			noteGuardModelFailure();
 		} catch (err) {
 			failures.push(`${modelName}: evaluation failed: ${(err as Error).message}`);
+			noteGuardModelFailure();
 		}
 	}
 
@@ -2235,6 +2362,7 @@ export async function evaluateCommand(
 			risk: "high",
 			authorization: "none",
 		},
+		modelFailure: true,
 	};
 }
 
@@ -2311,6 +2439,55 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 		return undefined;
 	}
 
+	/**
+	 * Human-approval fallback for when the guard model cannot produce a verdict.
+	 * Returns true (approved), false (denied), or null (no approval channel).
+	 * Wayang sessions use the web approval bridge; interactive TUI sessions get
+	 * an overlay; headless sessions return null (fail-closed).
+	 */
+	async function promptForCommandApproval(ctx: ExtensionContext, command: string, reason: string): Promise<boolean | null> {
+		const bridge = getWebCommandGuardApprovalBridge();
+		const sessionId = getWebCommandGuardSessionId(ctx);
+		if (bridge && sessionId) {
+			return bridge.requestCommandApproval(
+				sessionId,
+				"Command guard model unavailable",
+				guardApprovalTimeoutMs(),
+				{ command, reason },
+			);
+		}
+		if (!ctx.hasUI) return null;
+
+		const result = await ctx.ui.custom<boolean | null>(
+			(tui, theme, _keybindings, done) => {
+				const displayText = () => {
+					const commandText = `\n\n${theme.fg("dim", `Command:\n${command}`)}`;
+					const reasonText = `\n\n${theme.fg("dim", `Reason:\n${reason}`)}`;
+					const hint = theme.fg("dim", "(Enter to approve, Escape to deny)");
+					return `${theme.bold("Command guard model unavailable; approve this command?")}${reasonText}${commandText}\n\n${hint}`;
+				};
+				return {
+						render(_width: number) {
+						return displayText().split("\n");
+					},
+					invalidate() {},
+					handleInput(data: string): void {
+						if (matchesKey(data, Key.enter)) {
+							done(true);
+							return;
+						}
+						if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+							done(false);
+							return;
+						}
+					},
+				};
+			},
+			{ overlay: true },
+		);
+		return result ?? null;
+	}
+
 	function currentMode(): GuardMode {
 		return modeOverride ?? envCommandGuardMode();
 	}
@@ -2332,7 +2509,13 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 		const models = status && status.modelRoute.length > 0 ? status.modelRoute.join(" → ") : "none";
 		const source = status?.source ?? (modeOverride ? "runtime override" : "environment/default");
 		const pinStatus = configuredIdentityPin() ? "configured" : `missing/invalid (${identityPinFilePath()} must contain 8 digits)`;
-		return `Command guard mode: ${mode} (${source})\nModel route: ${models}\nIdentity PIN: ${pinStatus}\n\nCommands:\n  /command-guard off       Disable for this pi session (requires identity PIN)\n  /command-guard balanced  Default: local allow for safe inspection/SDLC commands\n  /command-guard audit     Warn but never block\n  /command-guard strict    Model verdict required for every bash command\n  /command-guard history   Show recent decisions`;
+		const health = guardModelHealthSnapshot();
+		const healthText = health.breakerOpen
+			? `degraded — circuit open (${health.consecutiveFailures} consecutive model failures; verdicts fall back to human approval)`
+			: health.consecutiveFailures > 0
+				? `degraded (${health.consecutiveFailures} consecutive model failures)`
+				: "ok";
+		return `Command guard mode: ${mode} (${source})\nModel route: ${models}\nModel health: ${healthText}\nIdentity PIN: ${pinStatus}\n\nCommands:\n  /command-guard off       Disable for this pi session (requires identity PIN)\n  /command-guard balanced  Default: local allow for safe inspection/SDLC commands\n  /command-guard audit     Warn but never block\n  /command-guard strict    Model verdict required for every bash command\n  /command-guard history   Show recent decisions`;
 	}
 
 	function compactModelLabel(modelSpec: string): string {
@@ -2452,8 +2635,39 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 			return undefined;
 		}
 
-		const { verdict, model } = await evaluateCommand(command, input, ctx);
+		const { verdict, model, modelFailure } = await evaluateCommand(command, input, ctx);
 		record(command, model, verdict);
+
+		// Model infrastructure failure: the human is the authority. Audit mode keeps
+		// warn-only semantics; otherwise ask the owning human and honor the answer.
+		// Headless sessions with no approval channel fail closed.
+		if (modelFailure) {
+			if (mode === "audit") {
+				if (ctx.hasUI) ctx.ui.notify(`Command guard audit warning: ${verdict.reason}`, "warning");
+				return undefined;
+			}
+			const approved = await promptForCommandApproval(ctx, command, verdict.reason);
+			if (approved === true) {
+				record(command, "user/approval", {
+					allow: true,
+					reason: "User approved command while guard model unavailable",
+					risk: verdict.risk ?? "medium",
+					authorization: "explicit",
+				});
+				return undefined;
+			}
+			const denial = approved === false
+				? `Command guard: user denied command while guard model unavailable (${verdict.reason})`
+				: `Command guard: human approval unavailable; guard model failed (${verdict.reason})`;
+			record(command, "user/denied", {
+					allow: false,
+					reason: denial,
+					risk: "high",
+					authorization: "none",
+				});
+			if (ctx.hasUI) ctx.ui.notify(`Command blocked: ${denial}`, "warning");
+			return { block: true, reason: `Command guard blocked (model unavailable): ${denial}` };
+		}
 
 		if (verdict.identity === "block") {
 			if (ctx.hasUI) ctx.ui.notify(`Command blocked: ${verdict.reason}`, "warning");
