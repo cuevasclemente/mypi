@@ -39,9 +39,9 @@ function fixture() {
     inventoryRoots: ["plugins", "skills"],
     components: {
       capabilities: [
-        { source: "plugins/alpha.ts", target: "extensions/alpha.ts", roles: ["narwhal", "sceptre"] },
-        { source: "skills/generic", target: "skills/generic", roles: ["narwhal", "sceptre"] },
-        { source: "hooks.json.example", target: "hooks.json", roles: ["narwhal", "sceptre"] },
+        { source: "plugins/alpha.ts", target: "extensions/alpha.ts", roles: ["narwhal", "sceptre", "tribe"] },
+        { source: "skills/generic", target: "skills/generic", roles: ["narwhal", "sceptre", "tribe"] },
+        { source: "hooks.json.example", target: "hooks.json", roles: ["narwhal", "sceptre", "tribe"] },
       ],
       "neutral-context": [
         { source: "deploy/neutral-context/AGENTS.md", target: "AGENTS.md", roles: ["narwhal"] },
