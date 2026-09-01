@@ -1,0 +1,1096 @@
+{
+  "format": "mypi-neutral-parity-v1",
+  "release": "tribe-mac-alignment-20260901",
+  "inventoryRoots": [
+    "plugins",
+    "skills"
+  ],
+  "sourceExclusions": [
+    {
+      "source": "plugins/hooks.example.json",
+      "roles": [
+        "tribe"
+      ],
+      "reason": "example-only hooks template; hooks.json.example is the shipped config"
+    },
+    {
+      "source": "plugins/key-switcher/index.ts",
+      "roles": [
+        "tribe"
+      ],
+      "reason": "secret-dependent OpenRouter key hot-swap; never distributed"
+    },
+    {
+      "source": "plugins/narwhal-horn/index.ts",
+      "roles": [
+        "tribe"
+      ],
+      "reason": "host-specific local llama.cpp provider registration"
+    },
+    {
+      "source": "plugins/privileged-exec-protocol.ts",
+      "roles": [
+        "tribe"
+      ],
+      "reason": "The-Sceptre-only privileged execution protocol; excluded from cross-host parity"
+    },
+    {
+      "source": "plugins/session-auto-title.ts",
+      "roles": [
+        "tribe"
+      ],
+      "reason": "Terra-model-specific opt-in titles; excluded from tribe baseline"
+    },
+    {
+      "source": "skills/narwhal-horn-model-migration/SKILL.md",
+      "roles": [
+        "tribe"
+      ],
+      "reason": "narwhal provider migration procedure; host-specific"
+    }
+  ],
+  "components": {
+    "capabilities": [
+      {
+        "source": "plugins/agent-monitor.ts",
+        "target": "extensions/agent-monitor.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/README.md",
+        "target": "extensions/agent-teams/README.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/SKILL.md",
+        "target": "extensions/agent-teams/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/child-policy-guard.ts",
+        "target": "extensions/agent-teams/child-policy-guard.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/companion-policy.ts",
+        "target": "extensions/agent-teams/companion-policy.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/durable-report-lifecycle.ts",
+        "target": "extensions/agent-teams/durable-report-lifecycle.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/durable-reports.ts",
+        "target": "extensions/agent-teams/durable-reports.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/goals.ts",
+        "target": "extensions/agent-teams/goals.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/index.ts",
+        "target": "extensions/agent-teams/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/privileged-exec-protocol.ts",
+        "target": "extensions/agent-teams/privileged-exec-protocol.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/subagent-manager.ts",
+        "target": "extensions/agent-teams/subagent-manager.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/subagent-runner.ts",
+        "target": "extensions/agent-teams/subagent-runner.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/tool-names.ts",
+        "target": "extensions/agent-teams/tool-names.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/browser-control.ts",
+        "target": "extensions/browser-control.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/claude-code/index.ts",
+        "target": "extensions/claude-code/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/command-authorization-monitor.ts",
+        "target": "extensions/command-authorization-monitor.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/hooks.ts",
+        "target": "extensions/hooks.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/human-input-tui-notifier/index.ts",
+        "target": "extensions/human-input-tui-notifier/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/human-input-tui-notifier/notifier.mjs",
+        "target": "extensions/human-input-tui-notifier/notifier.mjs",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/interview.ts",
+        "target": "extensions/interview.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/README.md",
+        "target": "extensions/memory-first-compaction/README.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/index.ts",
+        "target": "extensions/memory-first-compaction/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/ledger.ts",
+        "target": "extensions/memory-first-compaction/ledger.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/maintain-ledger.ts",
+        "target": "extensions/memory-first-compaction/maintain-ledger.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/reconcile-ledger.ts",
+        "target": "extensions/memory-first-compaction/reconcile-ledger.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/reconcile.ts",
+        "target": "extensions/memory-first-compaction/reconcile.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/memory-first-compaction/state.ts",
+        "target": "extensions/memory-first-compaction/state.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/MODEL-MANIFEST.md",
+        "target": "extensions/progressive-skills/MODEL-MANIFEST.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/README.md",
+        "target": "extensions/progressive-skills/README.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/embed-client.ts",
+        "target": "extensions/progressive-skills/embed-client.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/embed_worker.py",
+        "target": "extensions/progressive-skills/embed_worker.py",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/evaluate-relevance.ts",
+        "target": "extensions/progressive-skills/evaluate-relevance.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/index.ts",
+        "target": "extensions/progressive-skills/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/prompt.ts",
+        "target": "extensions/progressive-skills/prompt.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/relevance-fixture.json",
+        "target": "extensions/progressive-skills/relevance-fixture.json",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/safe-file.ts",
+        "target": "extensions/progressive-skills/safe-file.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/search.ts",
+        "target": "extensions/progressive-skills/search.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/wayang-smoke.cjs",
+        "target": "extensions/progressive-skills/wayang-smoke.cjs",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/worker-requirements.in",
+        "target": "extensions/progressive-skills/worker-requirements.in",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/progressive-skills/worker-requirements.lock",
+        "target": "extensions/progressive-skills/worker-requirements.lock",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/questionnaire.ts",
+        "target": "extensions/questionnaire.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/session-coordinator/README.md",
+        "target": "extensions/session-coordinator/README.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/session-coordinator/core.ts",
+        "target": "extensions/session-coordinator/core.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/session-coordinator/index.ts",
+        "target": "extensions/session-coordinator/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/ssh-clipboard-images.ts",
+        "target": "extensions/ssh-clipboard-images.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/sudo-hook.ts",
+        "target": "extensions/sudo-hook.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/todo/SMOKE.md",
+        "target": "extensions/todo/SMOKE.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/todo/index.ts",
+        "target": "extensions/todo/index.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/token-tracker.ts",
+        "target": "extensions/token-tracker.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/wayang-apps.ts",
+        "target": "extensions/wayang-apps.ts",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "plugins/agent-teams/SKILL.md",
+        "target": "skills/agent-teams/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "hooks.json.example",
+        "target": "hooks.json",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/agent-instruction-architecture/SKILL.md",
+        "target": "skills/agent-instruction-architecture/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/agent-scheduled-tasks/SKILL.md",
+        "target": "skills/agent-scheduled-tasks/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/aur-supply-chain-compromise-audit/SKILL.md",
+        "target": "skills/aur-supply-chain-compromise-audit/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/authenticated-large-downloads/SKILL.md",
+        "target": "skills/authenticated-large-downloads/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/authentik-forward-auth-deploy/SKILL.md",
+        "target": "skills/authentik-forward-auth-deploy/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/bicycle-tire-fitment-research/SKILL.md",
+        "target": "skills/bicycle-tire-fitment-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/bikepacking-trip-gear-planning/SKILL.md",
+        "target": "skills/bikepacking-trip-gear-planning/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/bluetooth-audio-microphone-research/SKILL.md",
+        "target": "skills/bluetooth-audio-microphone-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/caddy-lan-vpn-tls-gate/SKILL.md",
+        "target": "skills/caddy-lan-vpn-tls-gate/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/canine-renal-diet-treat-research/SKILL.md",
+        "target": "skills/canine-renal-diet-treat-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/claude-export-ingestion/SKILL.md",
+        "target": "skills/claude-export-ingestion/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/dog-exercise-mobility-safety-support/SKILL.md",
+        "target": "skills/dog-exercise-mobility-safety-support/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/e-bike-helmet-protective-gear-research/SKILL.md",
+        "target": "skills/e-bike-helmet-protective-gear-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/early-pregnancy-urgent-triage-support/SKILL.md",
+        "target": "skills/early-pregnancy-urgent-triage-support/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/food-preservation-safety-research/SKILL.md",
+        "target": "skills/food-preservation-safety-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/food-spoilage-safety-triage/SKILL.md",
+        "target": "skills/food-spoilage-safety-triage/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/garmin-wearable-support/SKILL.md",
+        "target": "skills/garmin-wearable-support/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/gut-health-supplement-evidence-review/SKILL.md",
+        "target": "skills/gut-health-supplement-evidence-review/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/home-assistant-automation-troubleshooting/SKILL.md",
+        "target": "skills/home-assistant-automation-troubleshooting/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/home-assistant-camera-troubleshooting/SKILL.md",
+        "target": "skills/home-assistant-camera-troubleshooting/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/home-assistant-dashboard-sensor-alerts/SKILL.md",
+        "target": "skills/home-assistant-dashboard-sensor-alerts/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/home-assistant-environment-sensor-research/SKILL.md",
+        "target": "skills/home-assistant-environment-sensor-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/home-assistant-music-assistant-airplay/SKILL.md",
+        "target": "skills/home-assistant-music-assistant-airplay/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/japanese-language-learning-support/SKILL.md",
+        "target": "skills/japanese-language-learning-support/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/kalshi-event-trading/SKILL.md",
+        "target": "skills/kalshi-event-trading/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/linux-live-usb-chroot-recovery/SKILL.md",
+        "target": "skills/linux-live-usb-chroot-recovery/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/linux-network-reachability-troubleshooting/SKILL.md",
+        "target": "skills/linux-network-reachability-troubleshooting/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/live-ocr-visual-translation-development/SKILL.md",
+        "target": "skills/live-ocr-visual-translation-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/local-air-quality-wildfire-smoke/SKILL.md",
+        "target": "skills/local-air-quality-wildfire-smoke/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/local-llm-inference-planning/SKILL.md",
+        "target": "skills/local-llm-inference-planning/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/local-service-provider-research/SKILL.md",
+        "target": "skills/local-service-provider-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/local-transit-trip-planning/SKILL.md",
+        "target": "skills/local-transit-trip-planning/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/mailsearch-email-archive-operations/SKILL.md",
+        "target": "skills/mailsearch-email-archive-operations/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/mcp/SKILL.md",
+        "target": "skills/mcp/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/meal-timing-nutrition-research/SKILL.md",
+        "target": "skills/meal-timing-nutrition-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/medical-lab-results-explanation/SKILL.md",
+        "target": "skills/medical-lab-results-explanation/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/memoriki/SKILL.md",
+        "target": "skills/memoriki/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/minimal-footwear-research-support/SKILL.md",
+        "target": "skills/minimal-footwear-research-support/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/motorcycle-first-bike-selection/SKILL.md",
+        "target": "skills/motorcycle-first-bike-selection/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/motorcycle-risk-research/SKILL.md",
+        "target": "skills/motorcycle-risk-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/nutrition-food-composition-research/SKILL.md",
+        "target": "skills/nutrition-food-composition-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/open-source-project-release-preparation/SKILL.md",
+        "target": "skills/open-source-project-release-preparation/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/opencloud-upgrade-operations/SKILL.md",
+        "target": "skills/opencloud-upgrade-operations/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/persistent-ssh-agent-fish-systemd/SKILL.md",
+        "target": "skills/persistent-ssh-agent-fish-systemd/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-assistant-pi-harness-migration/SKILL.md",
+        "target": "skills/personal-assistant-pi-harness-migration/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-fit-advice/SKILL.md",
+        "target": "skills/personal-style-fit-advice/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/LICENSE",
+        "target": "skills/personal-style-taste-development/LICENSE",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/SKILL.md",
+        "target": "skills/personal-style-taste-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/assets/COMPARISON-ROUND.md",
+        "target": "skills/personal-style-taste-development/assets/COMPARISON-ROUND.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/assets/CONFOUND-LOG.md",
+        "target": "skills/personal-style-taste-development/assets/CONFOUND-LOG.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/assets/PHOTO-BOUNDARIES.md",
+        "target": "skills/personal-style-taste-development/assets/PHOTO-BOUNDARIES.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/assets/REPLICATION-AND-TRANSFER.md",
+        "target": "skills/personal-style-taste-development/assets/REPLICATION-AND-TRANSFER.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/assets/REVEAL-AND-CORRECTION.md",
+        "target": "skills/personal-style-taste-development/assets/REVEAL-AND-CORRECTION.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/personal-style-taste-development/references/METHOD.md",
+        "target": "skills/personal-style-taste-development/references/METHOD.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pet-urgent-triage-support/SKILL.md",
+        "target": "skills/pet-urgent-triage-support/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-agent-teams-extension-debugging/SKILL.md",
+        "target": "skills/pi-agent-teams-extension-debugging/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-command-guard-operations/SKILL.md",
+        "target": "skills/pi-command-guard-operations/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-extension-distribution/SKILL.md",
+        "target": "skills/pi-extension-distribution/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-macos-host-installation/SKILL.md",
+        "target": "skills/pi-macos-host-installation/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-model-provider-configuration/SKILL.md",
+        "target": "skills/pi-model-provider-configuration/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-monitors/SKILL.md",
+        "target": "skills/pi-monitors/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-token-usage-analytics/SKILL.md",
+        "target": "skills/pi-token-usage-analytics/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pi-windows-host-installation/SKILL.md",
+        "target": "skills/pi-windows-host-installation/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/pregnancy-food-safety-research/SKILL.md",
+        "target": "skills/pregnancy-food-safety-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/privacy-aware-product-research/SKILL.md",
+        "target": "skills/privacy-aware-product-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/public-api-trading/SKILL.md",
+        "target": "skills/public-api-trading/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/report-publisher-mcp-development/SKILL.md",
+        "target": "skills/report-publisher-mcp-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/ruminant-vllm-gateway-development/SKILL.md",
+        "target": "skills/ruminant-vllm-gateway-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/rustdesk-server-operations/SKILL.md",
+        "target": "skills/rustdesk-server-operations/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/saqi-guided-search-development/SKILL.md",
+        "target": "skills/saqi-guided-search-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/secret-safe-browser-automation/SKILL.md",
+        "target": "skills/secret-safe-browser-automation/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/secret-safe-oauth-migration/SKILL.md",
+        "target": "skills/secret-safe-oauth-migration/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/server-expansion-drive-recovery/SKILL.md",
+        "target": "skills/server-expansion-drive-recovery/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/server-lattice-backup-operations/SKILL.md",
+        "target": "skills/server-lattice-backup-operations/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/server-lattice-caddyfile-deploy/SKILL.md",
+        "target": "skills/server-lattice-caddyfile-deploy/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/server-lattice-health-audit/SKILL.md",
+        "target": "skills/server-lattice-health-audit/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/service-health-check/SKILL.md",
+        "target": "skills/service-health-check/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/session-coordinator-extension/SKILL.md",
+        "target": "skills/session-coordinator-extension/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/shared-streaming-tts-broker-development/SKILL.md",
+        "target": "skills/shared-streaming-tts-broker-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/skincare-routine-product-research/SKILL.md",
+        "target": "skills/skincare-routine-product-research/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/steam-playtime-library-analysis/SKILL.md",
+        "target": "skills/steam-playtime-library-analysis/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/sudo-command-execution/SKILL.md",
+        "target": "skills/sudo-command-execution/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/tennis-racket-transition-advice/SKILL.md",
+        "target": "skills/tennis-racket-transition-advice/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/travel-rewards-flight-planning/SKILL.md",
+        "target": "skills/travel-rewards-flight-planning/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-apps/SKILL.md",
+        "target": "skills/wayang-apps/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-attachment-ingestion-development/SKILL.md",
+        "target": "skills/wayang-attachment-ingestion-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-browser-testing/SKILL.md",
+        "target": "skills/wayang-browser-testing/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-chat-performance-debugging/SKILL.md",
+        "target": "skills/wayang-chat-performance-debugging/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-chatterbox-tts-development/SKILL.md",
+        "target": "skills/wayang-chatterbox-tts-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-embedded-browser-workbench-development/SKILL.md",
+        "target": "skills/wayang-embedded-browser-workbench-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-project-registration/SKILL.md",
+        "target": "skills/wayang-project-registration/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-session-debugging/SKILL.md",
+        "target": "skills/wayang-session-debugging/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-session-deletion-development/SKILL.md",
+        "target": "skills/wayang-session-deletion-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-session-history-search/SKILL.md",
+        "target": "skills/wayang-session-history-search/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      },
+      {
+        "source": "skills/wayang-session-url-routing-development/SKILL.md",
+        "target": "skills/wayang-session-url-routing-development/SKILL.md",
+        "roles": [
+          "tribe"
+        ]
+      }
+    ]
+  },
+  "quarantine": {
+    "capabilities": {
+      "tribe": []
+    }
+  },
+  "protected": {
+    "tribe": [
+      "AGENTS.md",
+      "APPEND_SYSTEM.md"
+    ]
+  }
+}

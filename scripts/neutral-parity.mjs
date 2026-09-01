@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 
-export const ROLES = new Set(["narwhal", "sceptre"]);
+export const ROLES = new Set(["narwhal", "sceptre", "tribe"]);
 export const COMPONENTS = new Set(["capabilities", "neutral-context"]);
 const FORMAT = "mypi-neutral-parity-v1";
 const FORBIDDEN_PARTS = new Set([
