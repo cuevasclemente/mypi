@@ -12,6 +12,7 @@ import {
 	boundedSnapshotDetails,
 	boundedToolResult,
 	canonicalExistingDirectory,
+	coordinationWidgetVisible,
 	executeActivationAction,
 	findCanonicalGitProjectRoot,
 	findExistingRoom,
@@ -251,6 +252,20 @@ test("the common-root room takes precedence over a legacy linked-worktree room",
 	assert.equal(follower.discoverAndJoin(metadata(linkedRoot))?.roomDir, commonState.roomDir);
 	common.leave();
 	follower.leave();
+});
+
+test("coordination widget visibility is false for an empty room and true when a peer joins", () => {
+	const root = temporaryDirectory("empty-widget");
+	const core = new SessionCoordinatorCore({ scheduler: new FakeScheduler() });
+	const peer = new SessionCoordinatorCore({ scheduler: new FakeScheduler() });
+	core.ensure(metadata(root, "self"));
+
+	assert.equal(coordinationWidgetVisible(core.snapshot()!, core.getStartedAt()), false);
+
+	peer.ensure(metadata(root, "peer"));
+	assert.equal(coordinationWidgetVisible(core.snapshot()!, core.getStartedAt()), true);
+	core.leave();
+	peer.leave();
 });
 
 test("independent coordinator instances own independent leases and timers", () => {

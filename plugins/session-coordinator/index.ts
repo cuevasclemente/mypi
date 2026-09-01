@@ -15,6 +15,7 @@ import {
 	SessionCoordinatorCore,
 	boundedSnapshotDetails,
 	boundedToolResult,
+	coordinationWidgetVisible,
 	executeActivationAction,
 	findCanonicalGitProjectRoot,
 	type ActiveClaim,
@@ -166,9 +167,8 @@ function buildPromptBlock(core: SessionCoordinatorCore, snapshot: CoordinationSn
 	return lines.join("\n");
 }
 
-function renderWidget(core: SessionCoordinatorCore, snapshot: CoordinationSnapshot, theme: Theme): Text | undefined {
+function renderWidget(core: SessionCoordinatorCore, snapshot: CoordinationSnapshot, theme: Theme): Text {
 	const unread = unreadCount(core, snapshot);
-	if (!snapshot.activePeers.length && !snapshot.claims.length && !unread) return undefined;
 	const parts = [`${snapshot.activePeers.length} peer${snapshot.activePeers.length === 1 ? "" : "s"}`];
 	if (unread) parts.push(`${unread} unread`);
 	if (snapshot.claims.length) parts.push(`${snapshot.claims.length} claim${snapshot.claims.length === 1 ? "" : "s"}`);
@@ -180,7 +180,7 @@ function renderWidget(core: SessionCoordinatorCore, snapshot: CoordinationSnapsh
 	return new Text(lines.join("\n"), 0, 0);
 }
 
-function updateUi(core: SessionCoordinatorCore, ctx: ExtensionContext): void {
+export function updateUi(core: SessionCoordinatorCore, ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
 	const snapshot = core.snapshot(8);
 	if (!snapshot) return;
@@ -189,6 +189,10 @@ function updateUi(core: SessionCoordinatorCore, ctx: ExtensionContext): void {
 	if (unread) parts.push(`${unread} unread`);
 	if (snapshot.claims.length) parts.push(`${snapshot.claims.length} claim${snapshot.claims.length === 1 ? "" : "s"}`);
 	ctx.ui.setStatus(EXTENSION_NAME, ctx.ui.theme.fg("muted", parts.join(" · ")));
+	if (!coordinationWidgetVisible(snapshot, core.getStartedAt())) {
+		ctx.ui.setWidget(EXTENSION_NAME, undefined);
+		return;
+	}
 	ctx.ui.setWidget(EXTENSION_NAME, (_tui, theme) => renderWidget(core, snapshot, theme));
 }
 

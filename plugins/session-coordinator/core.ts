@@ -74,6 +74,12 @@ export interface CoordinationSnapshot {
 	claims: ActiveClaim[];
 }
 
+export function coordinationWidgetVisible(snapshot: CoordinationSnapshot, startedAt: string): boolean {
+	return snapshot.activePeers.length > 0
+		|| snapshot.claims.length > 0
+		|| snapshot.messages.some((message) => message.sessionToken !== snapshot.self.token && message.createdAt > startedAt);
+}
+
 interface RoomMetadata {
 	version: 1;
 	id: string;
