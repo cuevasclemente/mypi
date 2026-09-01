@@ -39,8 +39,20 @@ Passed:
 
 A direct ad hoc `tsc` command reports the same pre-existing implicit-`any`, nullable PIN option, and `.ts` import-option errors on unchanged `origin/main`; it is not a regression gate for this extension. The aggregate extension validator retains its known `@earendil-works/pi-ai/compat` temporary-bundle resolution failure documented in the Frost rollout plan. Focused runtime tests and esbuild bundling are authoritative for this change.
 
-## Deployment and rollback
+## Deployment and live verification
 
-The source and active installed extension must be synchronized together after review, with a timestamped owner-private backup of the installed file. Existing Pi processes need `/reload` or restart; Frost-Walrus needs the corrected capability payload installed before its session behavior changes.
+Clemente explicitly approved publishing and deploying both hosts through a Wayang questionnaire.
 
-Rollback by restoring the prior installed extension backup and reverting the source commit. Wayang itself requires no code change because it already publishes the exact ownership witness before extension lifecycle binding.
+- Commit `3f70d1d` was fast-forwarded to canonical `mypi/main` and pushed to GitHub.
+- The-Sceptre source and installed extension are byte-identical at SHA-256 `ea384250ab59bf0bed77d8ea7d64803baa10b0ba381c45b468bb4a7f1525a8e8`.
+- The-Sceptre rollback copy: `~/.pi/agent/extensions/.backups/command-guard-pi-cli-scope-20260901T225637Z/command-authorization-monitor.ts` (directory `0700`, file `0600`).
+- Frost-Walrus was reached using a separate temporary known-hosts file after its ED25519 fingerprint matched the previously approved Frost rollout plan. The shared dual-boot host-key entry was not changed.
+- Frost-Walrus rollback copy: `~/.pi/agent/extensions/.backups/command-guard-pi-cli-scope-20260901T225637Z-frost/command-authorization-monitor.ts` (directory `0700`, file `0600`).
+- Frost-Walrus installed extension is mode `0644` and matches the source hash above.
+- A synthetic Frost smoke loaded the installed extension through Pi's real extension loader, confirmed the exact DNS command passed standalone `tool_call` and `user_bash` hooks, and ran the actual `resolvectl` query successfully with exit code 0.
+
+Existing Pi processes retain their already loaded extension code until `/reload` or restart. Wayang itself requires no code change because it already publishes the exact ownership witness before extension lifecycle binding.
+
+## Rollback
+
+Restore the exact host-local backup over `~/.pi/agent/extensions/command-authorization-monitor.ts`, then `/reload` or restart the affected Pi process. Revert `3f70d1d` rather than rewriting published history if source rollback is required.
