@@ -23,6 +23,7 @@ interface Question {
 	label: string;
 	prompt: string;
 	options: QuestionOption[];
+	/** Legacy compatibility field; normalized to true because free text is always available. */
 	allowOther: boolean;
 }
 
@@ -34,11 +35,46 @@ interface Answer {
 	index?: number;
 }
 
+type QuestionnaireStatus = "submitted" | "pending" | "cancelled" | "error";
+
 interface QuestionnaireResult {
 	questions: Question[];
 	answers: Answer[];
+	/** Explicit bridge outcome; do not infer cancellation from an empty answer list. */
+	status: QuestionnaireStatus;
+	/** Kept for existing TUI result renderers and consumers. */
 	cancelled: boolean;
+	requestId?: string;
+	submissionId?: string;
+	error?: string;
 }
+
+interface InterviewRequestMetadata {
+	toolName: "questionnaire";
+	toolCallId: string;
+	piSessionId?: string;
+	piSessionFile?: string;
+}
+
+type BridgeOutcome =
+	| {
+		status: "submitted";
+		request: { requestId: string };
+		submission: { submissionId: string };
+		answers?: Answer[];
+	}
+	| {
+		status: "pending" | "cancelled";
+		request: { requestId: string };
+	};
+
+type WebQuestionnaireContext = {
+	cwd: string;
+	sessionManager?: {
+		getSessionId?: () => string;
+		getSessionFile?: () => string | undefined;
+	};
+};
 
 // Schema
 const QuestionOptionSchema = Type.Object({
@@ -56,7 +92,7 @@ const QuestionSchema = Type.Object({
 	),
 	prompt: Type.String({ description: "The full question text to display" }),
 	options: Type.Array(QuestionOptionSchema, { description: "Available options to choose from" }),
-	allowOther: Type.Optional(Type.Boolean({ description: "Allow 'Type something' option (default: true)" })),
+	allowOther: Type.Optional(Type.Boolean({ description: "Deprecated and ignored; free-text entry is always available." })),
 });
 
 const QuestionnaireParams = Type.Object({
@@ -69,7 +105,151 @@ function errorResult(
 ): { content: { type: "text"; text: string }[]; details: QuestionnaireResult } {
 	return {
 		content: [{ type: "text", text: message }],
-		details: { questions, answers: [], cancelled: true },
+		details: { questions, answers: [], status: "error", cancelled: false, error: message },
+	};
+}
+
+interface BackendBridge {
+	/** Durable bridge API: a grace-period expiry returns pending, not cancelled. */
+	createRequestWithOutcome(
+		sessionId: string,
+		questions: Question[],
+		options: InterviewRequestMetadata & { timeoutMs?: number },
+	): Promise<BridgeOutcome>;
+}
+
+function getBridge(): BackendBridge {
+	if (!(globalThis as any).__pi_interview_bridge) {
+		(globalThis as any).__pi_interview_bridge = {
+			createRequestWithOutcome: () => Promise.reject(new Error("No interview backend")),
+		};
+	}
+	return (globalThis as any).__pi_interview_bridge;
+}
+
+function mapSessionId(mapName: string, key: string | undefined): string | undefined {
+	if (!key) return undefined;
+	const map = (globalThis as any)[mapName] as Map<string, string> | undefined;
+	return map?.get(key);
+}
+
+function sessionIdentity(ctx: WebQuestionnaireContext): { piSessionId?: string; piSessionFile?: string } {
+	try {
+		return {
+			piSessionId: ctx.sessionManager?.getSessionId?.(),
+			piSessionFile: ctx.sessionManager?.getSessionFile?.(),
+		};
+	} catch {
+		// Session identity is diagnostic metadata; retain the cwd fallback below.
+		return {};
+	}
+}
+
+function resolveWebSession(ctx: WebQuestionnaireContext): { sessionId?: string; piSessionId?: string; piSessionFile?: string } {
+	const { piSessionId, piSessionFile } = sessionIdentity(ctx);
+	const sessionId =
+		mapSessionId("__pi_interview_pi_sessions", piSessionId) ??
+		mapSessionId("__pi_interview_session_files", piSessionFile) ??
+		mapSessionId("__pi_interview_cwd_sessions", ctx.cwd);
+	return { sessionId, piSessionId, piSessionFile };
+}
+
+async function webQuestionnaire(
+	questions: Question[],
+	toolCallId: string,
+	ctx: WebQuestionnaireContext,
+): Promise<QuestionnaireResult> {
+	const { sessionId, piSessionId, piSessionFile } = resolveWebSession(ctx);
+	if (!sessionId) {
+		return {
+			questions,
+			answers: [],
+			status: "error",
+			cancelled: false,
+			error: "Questionnaire bridge has no Wayang session mapping for this pi session.",
+		};
+	}
+
+	try {
+		const outcome = await getBridge().createRequestWithOutcome(sessionId, questions, {
+			toolName: "questionnaire",
+			toolCallId,
+			piSessionId,
+			piSessionFile,
+			timeoutMs: 120_000,
+		});
+		const requestId = outcome.request.requestId;
+		if (typeof requestId !== "string" || !requestId) {
+			throw new Error("Questionnaire bridge returned an outcome without durable request provenance.");
+		}
+		const submissionId = outcome.status === "submitted" ? outcome.submission?.submissionId : undefined;
+		if (outcome.status === "submitted" && (typeof submissionId !== "string" || !submissionId)) {
+			throw new Error("Questionnaire bridge returned a submitted outcome without durable submission provenance.");
+		}
+		const answers = (outcome.status === "submitted" ? outcome.answers ?? [] : []).map((a: any) => ({
+			id: a.id,
+			value: a.value,
+			label: a.label,
+			wasCustom: a.wasCustom || false,
+			index: a.index,
+		}));
+		return {
+			questions,
+			answers,
+			status: outcome.status,
+			cancelled: outcome.status === "cancelled",
+			requestId,
+			submissionId,
+		};
+	} catch (error) {
+		return {
+			questions,
+			answers: [],
+			status: "error",
+			cancelled: false,
+			error: error instanceof Error ? error.message : "Questionnaire bridge request failed.",
+		};
+	}
+}
+
+function formatResult(result: QuestionnaireResult, questions: Question[]) {
+	if (result.status === "error") {
+		return {
+			content: [{ type: "text" as const, text: `Questionnaire bridge error: ${result.error || "request failed"}` }],
+			details: result,
+		};
+	}
+
+	if (result.status === "pending") {
+		const request = result.requestId ? ` (request ${result.requestId})` : "";
+		return {
+			content: [{
+				type: "text" as const,
+				text: `The questionnaire remains open${request}. Do not treat this as cancelled; a later submission will arrive as a wayang-interview-submission message.`,
+			}],
+			details: result,
+		};
+	}
+
+	if (result.cancelled) {
+		return {
+			content: [{ type: "text" as const, text: "User cancelled the questionnaire" }],
+			details: result,
+		};
+	}
+
+	const answerLines = result.answers.map((a) => {
+		const qLabel = questions.find((q) => q.id === a.id)?.label || a.id;
+		if (a.wasCustom) return `${qLabel}: user wrote: ${a.label}`;
+		return `${qLabel}: user selected: ${a.index}. ${a.label}`;
+	});
+	const provenanceLine = result.requestId && result.submissionId
+		? `Questionnaire submitted (request ID ${JSON.stringify(result.requestId)}, submission ID ${JSON.stringify(result.submissionId)}).`
+		: undefined;
+
+	return {
+		content: [{ type: "text" as const, text: [provenanceLine, ...answerLines].filter(Boolean).join("\n") }],
+		details: result,
 	};
 }
 
@@ -81,10 +261,7 @@ export default function questionnaire(pi: ExtensionAPI) {
 			"Ask the user one or more questions. Use for clarifying requirements, getting preferences, or confirming decisions. For single questions, shows a simple option list. For multiple questions, shows a tab-based interface.",
 		parameters: QuestionnaireParams,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (!ctx.hasUI) {
-				return errorResult("Error: UI not available (running in non-interactive mode)");
-			}
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.questions.length === 0) {
 				return errorResult("Error: No questions provided");
 			}
@@ -93,8 +270,13 @@ export default function questionnaire(pi: ExtensionAPI) {
 			const questions: Question[] = params.questions.map((q, i) => ({
 				...q,
 				label: q.label || `Q${i + 1}`,
-				allowOther: q.allowOther !== false,
+				// Retain the field for bridge/schema compatibility, but never disable free text.
+				allowOther: true,
 			}));
+
+			if (!ctx.hasUI) {
+				return formatResult(await webQuestionnaire(questions, toolCallId, ctx), questions);
+			}
 
 			const isMulti = questions.length > 1;
 			const totalTabs = questions.length + 1; // questions + Submit
@@ -127,8 +309,20 @@ export default function questionnaire(pi: ExtensionAPI) {
 					tui.requestRender();
 				}
 
+				function orderedAnswers(): Answer[] {
+					return questions
+						.map((question) => answers.get(question.id))
+						.filter((answer): answer is Answer => answer !== undefined);
+				}
+
 				function submit(cancelled: boolean) {
-					done({ questions, answers: Array.from(answers.values()), cancelled });
+					done({
+						questions,
+						// Navigation can answer questions out of order; preserve question order in results.
+						answers: orderedAnswers(),
+						status: cancelled ? "cancelled" : "submitted",
+						cancelled,
+					});
 				}
 
 				function currentQuestion(): Question | undefined {
@@ -138,11 +332,7 @@ export default function questionnaire(pi: ExtensionAPI) {
 				function currentOptions(): RenderOption[] {
 					const q = currentQuestion();
 					if (!q) return [];
-					const opts: RenderOption[] = [...q.options];
-					if (q.allowOther) {
-						opts.push({ value: "__other__", label: "Type something.", isOther: true });
-					}
-					return opts;
+					return [...q.options, { value: "__other__", label: "Type something.", isOther: true }];
 				}
 
 				function allAnswered(): boolean {
@@ -372,25 +562,7 @@ export default function questionnaire(pi: ExtensionAPI) {
 				};
 			});
 
-			if (result.cancelled) {
-				return {
-					content: [{ type: "text", text: "User cancelled the questionnaire" }],
-					details: result,
-				};
-			}
-
-			const answerLines = result.answers.map((a) => {
-				const qLabel = questions.find((q) => q.id === a.id)?.label || a.id;
-				if (a.wasCustom) {
-					return `${qLabel}: user wrote: ${a.label}`;
-				}
-				return `${qLabel}: user selected: ${a.index}. ${a.label}`;
-			});
-
-			return {
-				content: [{ type: "text", text: answerLines.join("\n") }],
-				details: result,
-			};
+			return formatResult(result, questions);
 		},
 
 		renderCall(args, theme, _context) {
@@ -410,6 +582,12 @@ export default function questionnaire(pi: ExtensionAPI) {
 			if (!details) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
+			}
+			if (details.status === "error") {
+				return new Text(theme.fg("error", details.error || "Questionnaire bridge error"), 0, 0);
+			}
+			if (details.status === "pending") {
+				return new Text(theme.fg("warning", "Pending — a later submission will arrive as a Wayang message"), 0, 0);
 			}
 			if (details.cancelled) {
 				return new Text(theme.fg("warning", "Cancelled"), 0, 0);

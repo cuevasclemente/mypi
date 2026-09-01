@@ -534,6 +534,6 @@ Phases 1.1 / 1.3 / 1.4 can be parallelized via subagents during implementation. 
 ## Out of scope
 
 - Auto-installation / package management for the extension (manual symlink for now, per the established pattern with key-switcher).
-- Web UI surface (`pi-web-ui` integration). The provider registers via `ExtensionAPI` so any pi runtime — CLI or web — picks it up uniformly.
+- Web UI surface (`wayang` integration). The provider registers via `ExtensionAPI` so any pi runtime — CLI or web — picks it up uniformly.
 - Token refresh / OAuth login flow: handled entirely by the `claude` binary; pi never touches OAuth tokens.
 - `/login claude-code` flow: not needed because there's no provider-level OAuth in pi for this provider. Users authenticate via `claude` directly.

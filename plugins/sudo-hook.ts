@@ -1,220 +1,491 @@
-/**
- * Sudo Password Hook Extension
- *
- * Intercepts sudo commands from both the agent's bash tool and user !commands.
- * Prompts for the sudo password once per session and caches it in memory only.
- * The password is piped via stdin (echo ... | sudo -S) so it never leaves the
- * local process — it's not written to disk, environment variables, or sent over
- * any network.
- *
- * Usage:
- *   pi -e .pi/extensions/sudo-hook.ts
- *
- * Or place in ~/.pi/agent/extensions/sudo-hook.ts for global use.
- */
-
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Key } from "@earendil-works/pi-tui";
+import { Text, Key, matchesKey } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import {
+  BoundedByteAccumulator,
+  PRIVILEGED_EXEC_CANCEL_MESSAGE,
+  PRIVILEGED_EXEC_LIMITS,
+  PRIVILEGED_EXEC_PROTOCOL_VERSION,
+  PRIVILEGED_EXEC_REQUEST_MESSAGE,
+  PRIVILEGED_EXEC_RESULT_MESSAGE,
+  assertPrivilegedExecRequest,
+  isPrivilegedExecCancelMessage,
+  isPrivilegedExecRequestMessage,
+  isPrivilegedExecResultMessage,
+  privilegedExecRuntimeRegistry,
+  type PrivilegedExecBrokerRuntime,
+  type PrivilegedExecOrigin,
+  type PrivilegedExecRequest,
+  type PrivilegedExecResult,
+} from "./agent-teams/privileged-exec-protocol.js";
 
-/** Escape single quotes in a string for use in a single-quoted shell string. */
-function shellEscape(s: string): string {
-  return s.replace(/'/g, `'\\''`);
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_PASSWORD_ATTEMPTS = 3;
+const SUDO_PATH = "/usr/bin/sudo";
+const PIN_NAME = "command-guard-identity-pin";
+const PIN_ACCESS_RE = new RegExp(`(?:${PIN_NAME}|PI_COMMAND_GUARD_IDENTITY_PIN)`, "i");
+
+type WebOptions = {
+  executable: string;
+  argv: string[];
+  cwd: string;
+  timeoutMs: number;
+  origin: PrivilegedExecOrigin;
+};
+
+interface WebSudoBridge {
+  requestPassword(sessionId: string, prompt: string, timeoutMs?: number, options?: WebOptions): Promise<string | null>;
+  requestApproval(sessionId: string, prompt: string, timeoutMs?: number, options?: WebOptions): Promise<boolean>;
+  cancelSession?(sessionId: string): void;
 }
 
-/** Pipe the password into sudo via stdin using printf for safety. */
-const SUDO_PIPELINE = (password: string, command: string) =>
-  `printf '%s\\n' '${shellEscape(password)}' | sudo -S ${command}`;
+function runtimeKey(ctx: ExtensionContext): string {
+  return ctx.sessionManager.getSessionId()
+    ?? ctx.sessionManager.getSessionFile()
+    ?? `ephemeral:${process.pid}:${ctx.cwd}`;
+}
+
+function webSessionId(ctx: ExtensionContext): string | null {
+  const managerMap = (globalThis as any).__pi_sudo_session_managers as WeakMap<object, string> | undefined;
+  if (managerMap) return managerMap.get(ctx.sessionManager as object) ?? null;
+  const piMap = (globalThis as any).__pi_sudo_pi_sessions as Map<string, string> | undefined;
+  const fileMap = (globalThis as any).__pi_sudo_session_files as Map<string, string> | undefined;
+  const id = ctx.sessionManager.getSessionId();
+  if (id && piMap?.has(id)) return piMap.get(id)!;
+  const file = ctx.sessionManager.getSessionFile();
+  if (file && fileMap?.has(file)) return fileMap.get(file)!;
+  return null;
+}
+
+function webBridge(): WebSudoBridge | null {
+  return ((globalThis as any).__pi_sudo_bridge as WebSudoBridge | undefined) ?? null;
+}
+
+function displayRequest(request: PrivilegedExecRequest, origin: PrivilegedExecOrigin): string {
+  const argv = request.argv.map((value, index) => `argv[${index + 1}]: ${JSON.stringify(value)}`).join("\n") || "(no arguments)";
+  const lineage = origin.lineage.length ? origin.lineage.join(" → ") : "parent session";
+  return `Executable: ${request.executable}\n${argv}\nWorking directory: ${request.cwd}\nTimeout: ${request.timeoutMs} ms\nOrigin: ${origin.mode} (${lineage})`;
+}
+
+function rawSudoLikely(command: string): boolean {
+  return /(^|[\s;&|()])(?:[^\s;&|()]*\/)?sudo(?=$|[\s;&|()])/m.test(command);
+}
+
+function boundedError(message: string): string {
+  const bytes = Buffer.from(message || "privileged execution failed", "utf8");
+  return bytes.subarray(0, PRIVILEGED_EXEC_LIMITS.maxErrorBytes).toString("utf8") || "privileged execution failed";
+}
+
+function errorResult(message: string): PrivilegedExecResult {
+  return {
+    ok: false,
+    exitCode: null,
+    signal: null,
+    stdoutBase64: "",
+    stderrBase64: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    error: boundedError(message),
+  };
+}
+
+async function validateExecutable(request: PrivilegedExecRequest): Promise<void> {
+  assertPrivilegedExecRequest(request);
+  const [actualExecutable, actualCwd] = await Promise.all([
+    realpath(request.executable),
+    realpath(request.cwd),
+  ]);
+  if (actualExecutable !== request.executable) throw new Error("Executable path must be canonical and may not be a symlink");
+  if (actualCwd !== request.cwd) throw new Error("Working directory path must be canonical and may not be a symlink");
+
+  const [executableStat, cwdStat] = await Promise.all([stat(actualExecutable), stat(actualCwd)]);
+  if (!executableStat.isFile()) throw new Error("Executable must be a regular file");
+  if (executableStat.uid !== 0) throw new Error("Executable must be owned by root");
+  if ((executableStat.mode & 0o022) !== 0) throw new Error("Executable must not be group- or world-writable");
+  if ((executableStat.mode & 0o111) === 0) throw new Error("Executable is not executable");
+  if (!cwdStat.isDirectory()) throw new Error("Working directory is not a directory");
+}
+
+function runSudoValidation(password: string, cwd: string, signal?: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = spawn(SUDO_PATH, ["-k", "-S", "-p", "", "-v"], {
+      cwd,
+      shell: false,
+      stdio: ["pipe", "ignore", "ignore"],
+      env: process.env,
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const abort = () => { child.kill("SIGTERM"); finish(false); };
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    child.on("error", () => finish(false));
+    child.on("close", (code) => finish(code === 0));
+    child.stdin.on("error", () => {});
+    child.stdin.end(`${password}\n`);
+  });
+}
+
+function invalidateTimestamp(cwd: string): void {
+  try {
+    const child = spawn(SUDO_PATH, ["-k"], { cwd, shell: false, stdio: "ignore", env: process.env });
+    child.unref();
+  } catch {}
+}
+
+function executeDirect(
+  request: PrivilegedExecRequest,
+  password: string,
+  signal?: AbortSignal,
+): Promise<PrivilegedExecResult> {
+  return new Promise((resolve) => {
+    const stdout = new BoundedByteAccumulator();
+    const stderr = new BoundedByteAccumulator();
+    let settled = false;
+    let timedOut = false;
+    let child: ChildProcessWithoutNullStreams;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (result: PrivilegedExecResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      invalidateTimestamp(request.cwd);
+      resolve(result);
+    };
+    const terminate = () => {
+      child.kill("SIGTERM");
+      const killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      killTimer.unref?.();
+    };
+    const abort = () => terminate();
+
+    try {
+      child = spawn(SUDO_PATH, ["-k", "-S", "-p", "", "--", request.executable, ...request.argv], {
+        cwd: request.cwd,
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+      });
+    } catch (error) {
+      finish(errorResult(error instanceof Error ? error.message : String(error)));
+      return;
+    }
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, request.timeoutMs);
+    timer.unref?.();
+
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
+    child.stdin.on("error", () => {});
+    child.stdin.end(`${password}\n`);
+    child.on("error", (error) => finish(errorResult(error.message)));
+    child.on("close", (code, closeSignal) => {
+      const out = stdout.result();
+      const err = stderr.result();
+      if (timedOut || signal?.aborted) {
+        finish({
+          ok: false,
+          exitCode: code,
+          signal: closeSignal,
+          stdoutBase64: out.base64,
+          stderrBase64: err.base64,
+          stdoutTruncated: out.truncated,
+          stderrTruncated: err.truncated,
+          error: timedOut ? "privileged execution timed out" : "privileged execution cancelled",
+        });
+        return;
+      }
+      finish({
+        ok: true,
+        exitCode: code,
+        signal: closeSignal,
+        stdoutBase64: out.base64,
+        stderrBase64: err.base64,
+        stdoutTruncated: out.truncated,
+        stderrTruncated: err.truncated,
+        error: null,
+      });
+    });
+  });
+}
 
 export default function (pi: ExtensionAPI) {
-  // Cached password — lives only in this closure's memory, never persisted
-  let sudoPassword: string | null = null;
+  let activeCtx: ExtensionContext | null = null;
+  let activeKey: string | null = null;
+  let cachedPassword: string | null = null;
+  let cacheTimer: ReturnType<typeof setTimeout> | null = null;
+  let queue: Promise<unknown> = Promise.resolve();
+  let shuttingDown = false;
+  const upstreamPending = new Map<string, {
+    resolve: (result: PrivilegedExecResult) => void;
+    abort?: () => void;
+  }>();
 
-  /**
-   * Prompt the user for their sudo password via a custom overlay component
-   * that masks input. Returns the password or null if cancelled.
-   */
-  async function promptForPassword(ctx: ExtensionContext): Promise<string | null> {
+  const clearPassword = () => {
+    cachedPassword = null;
+    if (cacheTimer) clearTimeout(cacheTimer);
+    cacheTimer = null;
+  };
+
+  const rememberPassword = (password: string) => {
+    clearPassword();
+    cachedPassword = password;
+    cacheTimer = setTimeout(clearPassword, CACHE_TTL_MS);
+    cacheTimer.unref?.();
+  };
+
+  async function promptPassword(ctx: ExtensionContext, request: PrivilegedExecRequest, origin: PrivilegedExecOrigin, message: string): Promise<string | null> {
+    const bridge = webBridge();
+    const sessionId = webSessionId(ctx);
+    const options: WebOptions = { ...request, argv: [...request.argv], origin: { mode: origin.mode, lineage: [...origin.lineage] } };
+    if (bridge && sessionId) return bridge.requestPassword(sessionId, message, 120_000, options);
     if (!ctx.hasUI) return null;
+    return (await ctx.ui.custom<string | null>((tui, theme, _keys, done) => {
+      let buffer = "";
+      return {
+        render() {
+          return [
+            theme.bold(message),
+            "",
+            ...displayRequest(request, origin).split("\n").map((line) => theme.fg("dim", line)),
+            "",
+            `${"•".repeat(buffer.length)}${theme.fg("accent", "▌")}`,
+            "",
+            theme.fg("dim", "Enter to confirm, Escape to cancel"),
+          ];
+        },
+        invalidate() {},
+        handleInput(data: string) {
+          if (matchesKey(data, Key.enter)) return done(buffer || null);
+          if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) return done(null);
+          if (matchesKey(data, Key.backspace) || matchesKey(data, Key.delete)) {
+            buffer = buffer.slice(0, -1);
+            tui.requestRender();
+            return;
+          }
+          if (data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) !== 127) {
+            buffer += data;
+            tui.requestRender();
+          }
+        },
+      };
+    }, { overlay: true })) ?? null;
+  }
 
-    // Use a custom overlay component to get masked input
-    const result = await ctx.ui.custom<string | null>(
-      (tui, theme, _keybindings, done) => {
-        let buffer = "";
+  async function approve(ctx: ExtensionContext, request: PrivilegedExecRequest, origin: PrivilegedExecOrigin): Promise<boolean> {
+    const bridge = webBridge();
+    const sessionId = webSessionId(ctx);
+    const options: WebOptions = { ...request, argv: [...request.argv], origin: { mode: origin.mode, lineage: [...origin.lineage] } };
+    if (bridge && sessionId) return bridge.requestApproval(sessionId, "Approve exact privileged execution?", 120_000, options);
+    if (!ctx.hasUI) return false;
+    return ctx.ui.confirm("Approve exact privileged execution?", displayRequest(request, origin));
+  }
 
-        // Compute the display string (masked with • characters)
-        const displayText = () => {
-          const masked = "•".repeat(buffer.length);
-          const prompt = theme.bold("Sudo password required");
-          const hint = theme.fg("dim", "(Enter to confirm, Escape to cancel)");
-          return `${prompt}\n\n${masked}${theme.fg("accent", "▌")}\n\n${hint}`;
-        };
+  async function executeRoot(
+    request: PrivilegedExecRequest,
+    origin: PrivilegedExecOrigin,
+    executionCtx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<PrivilegedExecResult> {
+    if (shuttingDown) return errorResult("privileged broker is unavailable");
+    try {
+      await validateExecutable(request);
+      if (PIN_ACCESS_RE.test(request.executable) || request.argv.some((arg) => PIN_ACCESS_RE.test(arg))) {
+        return errorResult("access to command-guard identity PIN configuration is forbidden");
+      }
+      if (!(await approve(executionCtx, request, origin))) return errorResult("privileged execution was not approved");
+      if (signal?.aborted) return errorResult("privileged execution cancelled");
 
-        const component = {
-          render(_width: number) {
-            return displayText().split("\n");
-          },
-          invalidate() {
-            // No cached state to clear
-          },
-          handleInput(data: string): void {
-            if (matchesKey(data, Key.enter)) {
-              done(buffer || null);
-              return;
-            }
-            if (matchesKey(data, Key.escape)) {
-              done(null);
-              return;
-            }
-            if (matchesKey(data, Key.backspace) || matchesKey(data, Key.delete)) {
-              if (buffer.length > 0) {
-                buffer = buffer.slice(0, -1);
-              }
-              tui.requestRender();
-              return;
-            }
-            if (matchesKey(data, Key.ctrl("c"))) {
-              done(null);
-              return;
-            }
-            // Only accept printable characters (single UTF-8 characters)
-            if (typeof data === "string" && data.length === 1) {
-              const code = data.charCodeAt(0);
-              // Accept printable ASCII (32-126) and any non-control Unicode
-              if (code >= 32 && code !== 127) {
-                buffer += data;
-                tui.requestRender();
-              }
-            }
-          },
-        };
-        return component;
-      },
-      { overlay: true },
+      let password = cachedPassword;
+      if (!password) {
+        for (let attempt = 1; attempt <= MAX_PASSWORD_ATTEMPTS; attempt++) {
+          const prompt = attempt === 1 ? "Sudo password required" : `Incorrect sudo password (${attempt}/${MAX_PASSWORD_ATTEMPTS})`;
+          const candidate = await promptPassword(executionCtx, request, origin, prompt);
+          if (!candidate) return errorResult("sudo authentication cancelled");
+          if (await runSudoValidation(candidate, request.cwd, signal)) {
+            rememberPassword(candidate);
+            password = candidate;
+            break;
+          }
+        }
+      }
+      if (!password) return errorResult("sudo authentication failed");
+      const result = await executeDirect(request, password, signal);
+      if (result.ok && result.exitCode === 1 && Buffer.from(result.stderrBase64, "base64").toString("utf8").toLowerCase().includes("password")) {
+        clearPassword();
+      }
+      return result;
+    } catch (error) {
+      return errorResult(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function executeSerialized(
+    request: PrivilegedExecRequest,
+    origin: PrivilegedExecOrigin,
+    executionCtx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<PrivilegedExecResult> {
+    const task = queue.then(
+      () => executeRoot(request, origin, executionCtx, signal),
+      () => executeRoot(request, origin, executionCtx, signal),
     );
-
-    return result ?? null;
+    queue = task.then(() => undefined, () => undefined);
+    return task;
   }
 
-  /**
-   * Check if a command contains sudo and, if so, inject the password.
-   * Returns the (possibly modified) command.
-   */
-  async function handleSudoCommand(
-    command: string,
-    ctx: ExtensionContext,
-  ): Promise<{ command: string; blocked: boolean; reason?: string }> {
-    // Quick check — only proceed if the shell command invokes sudo as a command
-    // token. Do not trigger on filenames like "sudo-hook.ts".
-    if (!/(^|[\s;&|()])sudo(?=\s|$)/.test(command)) {
-      return { command, blocked: false };
-    }
+  const onParentMessage = (message: unknown) => {
+    if (!isPrivilegedExecResultMessage(message)) return;
+    const pending = upstreamPending.get(message.requestId);
+    if (!pending) return;
+    upstreamPending.delete(message.requestId);
+    if (pending.abort) activeCtx?.signal?.removeEventListener("abort", pending.abort);
+    pending.resolve(message.result);
+  };
 
-    if (!ctx.hasUI) {
-      return {
-        command,
-        blocked: true,
-        reason: "sudo requires interactive authentication (no UI available)",
+  process.on("message", onParentMessage);
+
+  function executeUpstream(request: PrivilegedExecRequest, signal?: AbortSignal): Promise<PrivilegedExecResult> {
+    if (typeof process.send !== "function" || !process.connected) return Promise.resolve(errorResult("parent privileged broker IPC is unavailable"));
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      const abort = () => {
+        if (typeof process.send === "function" && process.connected) {
+          process.send({ type: PRIVILEGED_EXEC_CANCEL_MESSAGE, version: PRIVILEGED_EXEC_PROTOCOL_VERSION, requestId });
+        }
       };
-    }
+      upstreamPending.set(requestId, { resolve, abort });
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+      process.send!({
+        type: PRIVILEGED_EXEC_REQUEST_MESSAGE,
+        version: PRIVILEGED_EXEC_PROTOCOL_VERSION,
+        requestId,
+        request,
+      }, (error) => {
+        if (!error) return;
+        upstreamPending.delete(requestId);
+        signal?.removeEventListener("abort", abort);
+        resolve(errorResult("failed to send privileged request to parent"));
+      });
+    });
+  }
 
-    // Prompt for password if not yet cached
-    if (!sudoPassword) {
-      const pw = await promptForPassword(ctx);
-      if (!pw || pw.length === 0) {
-        return {
-          command,
-          blocked: true,
-          reason: "sudo command blocked: no password provided",
-        };
+  const runtime: PrivilegedExecBrokerRuntime = {
+    execute(request, origin, signal) {
+      try { assertPrivilegedExecRequest(request); }
+      catch (error) { return Promise.resolve(errorResult(error instanceof Error ? error.message : String(error))); }
+      if (typeof process.send === "function" && process.connected) return executeUpstream(request, signal);
+      if (!activeCtx) return Promise.resolve(errorResult("privileged broker is unavailable"));
+      return executeSerialized(request, origin, activeCtx, signal);
+    },
+    async shutdown() {
+      shuttingDown = true;
+      clearPassword();
+      if (activeCtx) {
+        const sessionId = webSessionId(activeCtx);
+        if (sessionId) webBridge()?.cancelSession?.(sessionId);
+        invalidateTimestamp(activeCtx.cwd);
       }
-      sudoPassword = pw;
-    }
+      for (const [id, pending] of upstreamPending) {
+        upstreamPending.delete(id);
+        pending.resolve(errorResult("privileged broker shut down"));
+      }
+      await queue;
+    },
+  };
 
-    // Pipe the password into sudo via stdin
+  pi.registerTool({
+    name: "sudo_exec",
+    label: "Privileged Exec",
+    description: "Request explicitly approved privileged execution of one absolute executable with exact argv. No shell, stdin, or unbounded output. Raw stdout/stderr are capped at 64 KiB each.",
+    promptSnippet: "Run an absolute executable with exact argv through parent-approved sudo mediation",
+    promptGuidelines: [
+      "Use sudo_exec instead of putting sudo in bash commands.",
+      "sudo_exec accepts an absolute executable and literal argv only; it never accepts a shell command string.",
+      "Every sudo_exec call requires explicit user approval in the owning parent session.",
+      "Never place passwords, tokens, PINs, or other secrets in sudo_exec argv; tool arguments are visible in session history and approval UI.",
+    ],
+    parameters: Type.Object({
+      executable: Type.String({ description: "Canonical absolute executable path; no symlinks, shells, or interpreters" }),
+      argv: Type.Array(Type.String(), { description: "Exact literal arguments excluding argv[0]" }),
+      cwd: Type.Optional(Type.String({ description: "Canonical absolute working directory; defaults to the session cwd" })),
+      timeout_ms: Type.Optional(Type.Number({ description: "Timeout in milliseconds, maximum 300000" })),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const request: PrivilegedExecRequest = {
+        executable: params.executable,
+        argv: [...params.argv],
+        cwd: params.cwd ?? await realpath(ctx.cwd),
+        timeoutMs: params.timeout_ms ?? PRIVILEGED_EXEC_LIMITS.defaultTimeoutMs,
+      };
+      const origin: PrivilegedExecOrigin = { mode: "parent", lineage: [] };
+      const result = typeof process.send === "function" && process.connected
+        ? await runtime.execute(request, origin, signal)
+        : await executeSerialized(request, origin, ctx, signal);
+      const stdout = Buffer.from(result.stdoutBase64, "base64").toString("utf8");
+      const stderr = Buffer.from(result.stderrBase64, "base64").toString("utf8");
+      const lines = [
+        `exit=${result.exitCode ?? result.signal ?? "none"}${result.error ? ` error=${result.error}` : ""}`,
+        stdout ? `stdout${result.stdoutTruncated ? " (truncated)" : ""}:\n${stdout}` : "stdout: (empty)",
+        stderr ? `stderr${result.stderrTruncated ? " (truncated)" : ""}:\n${stderr}` : "stderr: (empty)",
+      ];
+      if (!result.ok) throw new Error(lines.join("\n"));
+      return { content: [{ type: "text", text: lines.join("\n") }], details: result };
+    },
+    renderCall(args, theme) {
+      return new Text(`${theme.fg("toolTitle", theme.bold("sudo_exec "))}${theme.fg("accent", args.executable ?? "...")}\n${theme.fg("dim", JSON.stringify(args.argv ?? []))}`, 0, 0);
+    },
+  });
+
+  pi.on("tool_call", async (event) => {
+    if (event.toolName === "bash" && rawSudoLikely(String((event.input as any).command ?? ""))) {
+      return { block: true, reason: "Raw sudo is disabled; use sudo_exec with an absolute executable and exact argv." };
+    }
+  });
+
+  pi.on("user_bash", async (event) => {
+    if (!rawSudoLikely(event.command)) return undefined;
     return {
-      command: SUDO_PIPELINE(sudoPassword, command),
-      blocked: false,
+      result: {
+        output: "Raw sudo is disabled; use sudo_exec with an absolute executable and exact argv.",
+        exitCode: 1,
+        cancelled: false,
+        truncated: false,
+      },
     };
-  }
-
-  // ── Agent bash tool interception ────────────────────────────────────────
-  pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName !== "bash") return undefined;
-
-    const result = await handleSudoCommand(event.input.command as string, ctx);
-
-    if (result.blocked) {
-      return { block: true, reason: result.reason };
-    }
-
-    // Mutate the command to include the password pipeline
-    if (result.command !== event.input.command) {
-      event.input.command = result.command;
-    }
-
-    return undefined;
   });
 
-  // ── User !command interception ──────────────────────────────────────────
-  pi.on("user_bash", async (event, ctx) => {
-    const result = await handleSudoCommand(event.command, ctx);
-
-    if (result.blocked) {
-      ctx.ui.notify(result.reason ?? "sudo blocked", "error");
-      return {
-        result: {
-          output: result.reason ?? "sudo blocked",
-          exitCode: 1,
-          cancelled: false,
-          truncated: false,
-        },
-      };
-    }
-
-    if (result.command !== event.command) {
-      // For user_bash, we need to return operations that run our modified command.
-      // pi's local bash backend won't see our command change via the event alone.
-      // We provide a wrapped operations object that prepends the sudo pipeline.
-      const local = createLocalBashOperations();
-
-      return {
-        operations: {
-          exec(cmd, cwd, options) {
-            // Replace the command with the sudo-piped version
-            const sudoCmd = SUDO_PIPELINE(sudoPassword!, cmd);
-            return local.exec(sudoCmd, cwd, options);
-          },
-        },
-      };
-    }
-
-    return undefined;
+  pi.on("session_start", async (_event, ctx) => {
+    activeCtx = ctx;
+    activeKey = runtimeKey(ctx);
+    shuttingDown = false;
+    privilegedExecRuntimeRegistry().set(activeKey, runtime);
   });
 
-  // ── Commands ────────────────────────────────────────────────────────────
-  pi.registerCommand("sudo-clear", {
-    description: "Forget the cached sudo password",
-    handler: async (_args, ctx) => {
-      if (sudoPassword) {
-        sudoPassword = null;
-        ctx.ui.notify("Sudo password cleared from memory", "info");
-      } else {
-        ctx.ui.notify("No sudo password cached", "info");
-      }
-    },
-  });
-
-  pi.registerCommand("sudo-reset", {
-    description: "Reset and re-prompt for sudo password on next use",
-    handler: async (_args, ctx) => {
-      sudoPassword = null;
-      ctx.ui.notify("Sudo password cleared. Will re-prompt on next sudo use.", "info");
-    },
-  });
-
-  // ── Session shutdown — clear password from memory ─────────────────────
   pi.on("session_shutdown", async () => {
-    sudoPassword = null;
+    if (activeKey && privilegedExecRuntimeRegistry().get(activeKey) === runtime) {
+      privilegedExecRuntimeRegistry().delete(activeKey);
+    }
+    process.off("message", onParentMessage);
+    await runtime.shutdown();
+    activeCtx = null;
+    activeKey = null;
   });
 }

@@ -6,15 +6,18 @@ SHELL := /usr/bin/env bash
 PI_USER_AGENT_DIR ?= $(HOME)/.pi/agent
 PI_USER_EXT_DIR ?= $(PI_USER_AGENT_DIR)/extensions
 PI_USER_SKILL_DIR ?= $(PI_USER_AGENT_DIR)/skills
+AGENT_CONTEXT_SOURCE ?= agent-context/AGENTS.md
+AGENT_CONTEXT_BACKUP_DIR ?= $(HOME)/.pi/backups/neutral-agent-context
 MODE ?= copy
 
-PLUGIN_NAMES := $(shell { find plugins -maxdepth 1 -type f -name '*.ts' -printf '%f\n' | sed 's/\.ts$$//'; find plugins -mindepth 2 -maxdepth 2 -type f -name index.ts -printf '%h\n' | sed 's#^plugins/##'; } 2>/dev/null | sort)
+PLUGIN_NAMES := $(shell { find plugins -maxdepth 1 -type f -name '*.ts' ! -name '*.test.ts' -printf '%f\n' | sed 's/\.ts$$//'; find plugins -mindepth 2 -maxdepth 2 -type f -name index.ts -printf '%h\n' | sed 's#^plugins/##'; } 2>/dev/null | sort)
 SKILL_NAMES := $(shell find skills -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
 PLUGINS ?= $(PLUGIN_NAMES)
 SKILLS ?= $(SKILL_NAMES)
 PROJECT_DIR ?=
+WAYANG_DIR ?= $(HOME)/src/wayang
 
-.PHONY: help list-plugins list-skills install install-all user-install install-extensions install-skills install-hooks install-agent-context install-dreamer-cron project-install make-project-install _install-extensions
+.PHONY: help list-plugins list-skills install install-all check-identity-neutral user-install install-extensions install-skills install-hooks install-agent-context install-neutral-context install-dreamer-cron install-companion-policy check-companion-policy project-install make-project-install _install-extensions
 
 help:
 	@printf '%s\n' \
@@ -24,7 +27,15 @@ help:
 	  '  make install' \
 	  '      Install all plugins to the user-level pi extension directory.' \
 	  '  make install-all' \
-	  '      Install plugins, skills, hooks config, global AGENTS.md, and dreamer timer.' \
+	  '      Install identity-neutral plugins, skills, hooks config, and dreamer timer; global context is excluded.' \
+	  '  make install-neutral-context' \
+	  '      Back up both context layers, install neutral AGENTS.md, and remove any identity append.' \
+	  '  make check-identity-neutral' \
+	  '      Verify installable context and install-all cannot activate a named identity.' \
+	  '  make install-companion-policy' \
+	  '      Back up and install reviewed Dream/Agent Teams policy, runner, cron, and skills.' \
+	  '  make check-companion-policy' \
+	  '      Run synthetic Dream/Agent Teams policy and runner regression tests.' \
 	  '  make user-install [PLUGINS="todo hooks"] [MODE=copy|symlink]' \
 	  '      Install selected plugins to $(PI_USER_EXT_DIR).' \
 	  '  make project-install PROJECT_DIR=/path/to/project [PLUGINS="todo hooks"] [MODE=copy|symlink]' \
@@ -47,7 +58,10 @@ list-skills:
 
 install: user-install
 
-install-all: user-install install-skills install-hooks install-agent-context install-dreamer-cron
+install-all: check-identity-neutral user-install install-skills install-hooks install-dreamer-cron
+
+check-identity-neutral:
+	@bash scripts/test-identity-neutral-distribution.sh
 
 user-install install-extensions:
 	@$(MAKE) --no-print-directory _install-extensions DEST_DIR='$(PI_USER_EXT_DIR)' PLUGINS='$(PLUGINS)' MODE='$(MODE)'
@@ -75,10 +89,22 @@ install-hooks:
 	install -m 0644 hooks.json.example '$(PI_USER_AGENT_DIR)'/hooks.json; \
 	echo "installed hooks config -> $(PI_USER_AGENT_DIR)/hooks.json"
 
-install-agent-context:
-	@mkdir -p '$(PI_USER_AGENT_DIR)'; \
-	install -m 0644 AGENTS.md '$(PI_USER_AGENT_DIR)'/AGENTS.md; \
-	echo "installed global AGENTS.md -> $(PI_USER_AGENT_DIR)/AGENTS.md"
+install-agent-context: install-neutral-context
+
+install-neutral-context:
+	@bash scripts/install-neutral-context.sh '$(AGENT_CONTEXT_SOURCE)' '$(PI_USER_AGENT_DIR)' '$(AGENT_CONTEXT_BACKUP_DIR)'
+
+install-companion-policy:
+	@PI_AGENT_DIR='$(PI_USER_AGENT_DIR)' bash scripts/install-companion-policy-runtime.sh
+
+check-companion-policy:
+	@node scripts/validate-extensions.js
+	@node --test tests/agent-teams-companion-policy.test.ts tests/agent-teams-durable-reports.test.ts
+	@node scripts/test-agent-teams-tool-ceiling.mjs
+	@node scripts/test-dream-companion-policy.mjs
+	@bash scripts/test-dreamer-cron.sh
+	@node --test '$(WAYANG_DIR)/scripts/tests/dream-authorized-sessions.test.mjs'
+	@node --test plugins/privileged-exec-protocol.test.ts
 
 install-dreamer-cron:
 	@mkdir -p '$(PI_USER_AGENT_DIR)' '$(HOME)/.pi/logs' '$(HOME)/.config/systemd/user'; \
