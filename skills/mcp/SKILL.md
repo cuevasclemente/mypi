@@ -1,6 +1,7 @@
 ---
 name: mcp
-description: Create and install MCP (Model Context Protocol) servers for pi. Use when the user wants to add a new MCP server, configure API keys for MCP servers, troubleshoot MCP connections, or set up MCP tools. Covers the full workflow: finding, installing, configuring, and testing MCP servers with pi-mcp-adapter.
+description: >-
+  Create and install MCP (Model Context Protocol) servers for pi. Use when the user wants to add a new MCP server, configure API keys for MCP servers, troubleshoot MCP connections, or set up MCP tools. Covers the full workflow: finding, installing, configuring, and testing MCP servers with pi-mcp-adapter.
 ---
 
 # MCP Servers in Pi
@@ -280,7 +281,7 @@ chmod +x .pi/exa-mcp-wrapper.sh
 {
   "mcpServers": {
     "exasearch": {
-      "command": "/home/clemente/src/mypi/.pi/exa-mcp-wrapper.sh",
+      "command": "/absolute/path/to/mypi/.pi/exa-mcp-wrapper.sh",
       "args": [],
       "lifecycle": "lazy"
     }

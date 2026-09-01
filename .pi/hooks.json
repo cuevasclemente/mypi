@@ -1,0 +1,16 @@
+{
+  "hooks": [
+    {
+      "name": "mypi-session-end-checklist",
+      "trigger": "session_start",
+      "todos": [
+        {
+          "text": "End of session: If pi extensions/features/agents/teams were created or modified, install them to the user's pi context and journal the installation.",
+          "priority": "medium",
+          "assignee": "mypi-session-end-checklist",
+          "notes": "Install modified pi extensions/features/agents/teams to ~/.pi/agent/extensions, ~/.pi/agent/agents, or ~/.pi/agent/teams as appropriate before stopping. Keep runtime/source copies aligned when changing personal pi extensions."
+        }
+      ]
+    }
+  ]
+}

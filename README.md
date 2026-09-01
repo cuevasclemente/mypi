@@ -20,8 +20,12 @@ If you use pi and want ideas (or working code) for new providers, subagent orche
 |-----------------|--------------|
 | `agent-teams`   | Long-lived, stateful subagents. The main pi agent designs each subagent's identity (name + system prompt) at spawn time, then messages and polls it as work progresses. Also supports one-shot dispatch (single / parallel / chain) and a goal-tracking system. See [`plugins/agent-teams/README.md`](plugins/agent-teams/README.md). |
 | `agent-monitor` | A cheap, fast watcher model that reviews each agent turn and flags meaningful milestones — useful for prompting journaling, memory updates, or other end-of-turn rituals. |
+<<<<<<< HEAD
 | `session-auto-title` | Disabled-by-default, identity-neutral one-time Terra titles for ordinary interactive TUI sessions after three completed exchanges. |
 | `memory-first-compaction` | Independently opt-in persisted-memory guidance, 96K review/128K ordinary compaction sequencing, and a separate metadata-only HMAC ledger. See [`plugins/memory-first-compaction/README.md`](plugins/memory-first-compaction/README.md). |
+=======
+| `session-coordinator` | Filesystem-backed room/presence tooling so independent TUI/Wayang pi sessions in the same project can see peers, post notes, and claim work without being an agent team. |
+>>>>>>> feature/runtime-extensions
 | `dreamer`       | Scheduled systemd user timer that reflects on recent sessions and proposes new skills to extract. |
 
 #### Automatic session-title disclosure
@@ -35,9 +39,11 @@ Conversation prose can itself contain private facts, paths, or credentials autho
 | Plugin           | What it does |
 |------------------|--------------|
 | `todo`           | Persistent TODO management — survives across pi sessions. |
-| `hooks`          | Lifecycle-hook infrastructure. Define reminders in `hooks.json` that fire at specific events (session start/end, tool use, etc.). See `hooks.json.example`. |
+| `hooks`          | Lifecycle-hook infrastructure. Define reminders or TODO preseeds in `hooks.json` that fire at specific events (session start/end, tool use, etc.). See `hooks.json.example`. |
 | `interview` / `questionnaire` | Ask the user one or more structured questions and get back typed answers. Single-question and tab-bar multi-question modes. |
+| `ssh-clipboard-images` | In SSH/Mosh pi sessions, Ctrl+V (or `/paste-image`) reads an image from the local Kitty clipboard via OSC 5522 and attaches it to the next message. |
 | `sudo-hook`      | Example hook extension that feeds a sudo password to pi when prompted. |
+| `command-authorization-monitor` | Optional bash command guard. Defaults to balanced mode: local allow for safe read-only inspection, model review for everything else. The guard routes to a cheap/fast model for the active provider (for example DeepSeek V4 Flash for OpenRouter DeepSeek Pro, GPT-5.6 Luna for openai-codex GPT-5.6 Terra/Sol). Use `/command-guard off` at runtime, or set `PI_COMMAND_GUARD=off` before launch. |
 
 ### Skills
 
@@ -66,7 +72,8 @@ pi --extension ./plugins/todo "what's on my list?"
 # Install plugins to ~/.pi/agent/extensions (copies by default)
 make install
 
-# Install plugins, skills, hooks config, global AGENTS.md, and dreamer timer
+# Install plugins, skills, hooks config, and dreamer timer
+# (global identity/context remains an explicit separate install)
 make install-all
 
 # Or symlink plugins, so edits in this repo are live
@@ -83,12 +90,16 @@ make project-install PROJECT_DIR=/path/to/other-repo PLUGINS="todo"
 
 ```
 mypi/
+├── agent-context/        # Identity-neutral user context for optional global Pi installation
+│   └── AGENTS.md         #   Canonical generic source; contains no named agent identity
+├── AGENTS.md             # Instructions for working in this repository only
 ├── plugins/              # Source of truth for extensions (developed here)
 │   ├── agent-teams/      #   Subagent orchestration + goals
 │   ├── claude-code/      #   Claude Code subscription as a pi provider
 │   ├── narwhal-horn/     #   Local llama.cpp as a pi provider
 │   ├── key-switcher/     #   OpenRouter key hot-swap
 │   ├── todo/             #   Persistent TODOs
+│   ├── session-coordinator/ # Cross-session peer presence, messages, and claims
 │   ├── agent-monitor.ts  #   End-of-turn milestone detector
 │   ├── session-auto-title.ts # Opt-in interactive Terra titles
 │   ├── memory-first-compaction/ # Opt-in memory review/compaction + metadata ledger
@@ -107,7 +118,13 @@ mypi/
 - **Global** (`~/.pi/agent/extensions/`) — tools you want available everywhere.
 - **Project-local** (`<project>/.pi/extensions/`) — tools scoped to one workspace, versioned alongside that project's code.
 
-`make` handles both. `MODE=symlink` is handy during development so edits here are immediately reflected.
+`make` handles both. `MODE=symlink` is handy during development so edits in this repo are immediately reflected.
+
+The generic global user context has a separate source from this repository's own instructions. `make install-neutral-context` backs up both runtime context layers, installs `agent-context/AGENTS.md`, and removes any existing `APPEND_SYSTEM.md` into the recoverable backup so the resulting deployment is actually neutral. `make install-agent-context` is a compatibility alias. The root `AGENTS.md` remains project-local.
+
+`make install-all` intentionally excludes global context. Installing or synchronizing `mypi` deploys capabilities only: it must not install a named identity, identity anchor, autobiographical memory, or identity-specific capsule.
+
+The designated active Wren runtime is owned separately by `~/src/wren`. That repository composes this generic context with its private activation overlay and installs both runtime context layers through a guarded, rollback-capable flow. Copying or installing `mypi` elsewhere therefore produces a neutral agent by default.
 
 ## Working on a plugin
 
@@ -120,6 +137,32 @@ pi --skill ./skills/mcp/ "use the mcp skill"
 ```
 
 When it's working, `make install` (or symlink it) and it's live globally.
+
+## Command guard controls
+
+If `command-authorization-monitor` is installed, toggle it at runtime with slash commands (works in the terminal UI and wayang):
+
+```text
+/command-guard off       # disable for this pi session
+/command-guard balanced  # default: preallow safe read-only inspection
+/command-guard audit     # warn, never block
+/command-guard strict    # model verdict required for every bash command
+/command-guard status    # show current mode
+/command-guard history   # show recent decisions
+```
+
+`/cmd-guard` is a shorter alias. Slash-command changes last until `/reload` or pi restarts. The status output includes the model route the guard will try; by default it tracks the active provider and falls back to `openrouter/deepseek/deepseek-v4-flash` / `deepseek/deepseek-v4-flash` when no provider-specific cheap model is known.
+
+You can also configure it before starting `pi`:
+
+```bash
+PI_COMMAND_GUARD=off pi
+PI_COMMAND_GUARD_MODE=audit pi
+PI_COMMAND_GUARD_MODE=balanced pi
+PI_COMMAND_GUARD_MODE=strict pi
+```
+
+For a persistent disable, remove/rename `~/.pi/agent/extensions/command-authorization-monitor.ts` or set `PI_COMMAND_GUARD=off` in the environment that launches pi.
 
 ## Secrets
 

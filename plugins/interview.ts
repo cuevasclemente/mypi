@@ -30,6 +30,7 @@ interface Question {
   label: string;
   prompt: string;
   options: QuestionOption[];
+  /** Legacy compatibility field; normalized to true because free text is always available. */
   allowOther: boolean;
 }
 
@@ -41,11 +42,46 @@ interface Answer {
   index?: number;
 }
 
+type InterviewStatus = "submitted" | "pending" | "cancelled" | "error";
+
 interface InterviewResult {
   questions: Question[];
   answers: Answer[];
+  /** Explicit bridge outcome; do not infer cancellation from an empty answer list. */
+  status: InterviewStatus;
+  /** Kept for existing TUI result renderers and consumers. */
   cancelled: boolean;
+  requestId?: string;
+  submissionId?: string;
+  error?: string;
 }
+
+interface InterviewRequestMetadata {
+  toolName: "interview";
+  toolCallId: string;
+  piSessionId?: string;
+  piSessionFile?: string;
+}
+
+type BridgeOutcome =
+  | {
+    status: "submitted";
+    request: { requestId: string };
+    submission: { submissionId: string };
+    answers?: Answer[];
+  }
+  | {
+    status: "pending" | "cancelled";
+    request: { requestId: string };
+  };
+
+type WebInterviewContext = {
+  cwd: string;
+  sessionManager?: {
+    getSessionId?: () => string;
+    getSessionFile?: () => string | undefined;
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Global interview bridge (for web/SDK mode without TUI)
@@ -56,21 +92,49 @@ interface InterviewResult {
  * stores on globalThis. The extension calls getBridge() to access it.
  */
 interface BackendBridge {
-  createRequest(
+  /** Durable bridge API: a grace-period expiry returns pending, not cancelled. */
+  createRequestWithOutcome(
     sessionId: string,
-    questions: any[],
-    timeoutMs?: number,
-  ): Promise<any[]>;
+    questions: Question[],
+    options: InterviewRequestMetadata & { timeoutMs?: number },
+  ): Promise<BridgeOutcome>;
 }
 
 function getBridge(): BackendBridge {
   if (!(globalThis as any).__pi_interview_bridge) {
-    // Create a minimal fallback that rejects — used if backend isn't loaded
+    // Create a minimal fallback that rejects — used if backend isn't loaded.
     (globalThis as any).__pi_interview_bridge = {
-      createRequest: () => Promise.reject(new Error("No interview backend")),
+      createRequestWithOutcome: () => Promise.reject(new Error("No interview backend")),
     };
   }
   return (globalThis as any).__pi_interview_bridge;
+}
+
+function mapSessionId(mapName: string, key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  const map = (globalThis as any)[mapName] as Map<string, string> | undefined;
+  return map?.get(key);
+}
+
+function sessionIdentity(ctx: WebInterviewContext): { piSessionId?: string; piSessionFile?: string } {
+  try {
+    return {
+      piSessionId: ctx.sessionManager?.getSessionId?.(),
+      piSessionFile: ctx.sessionManager?.getSessionFile?.(),
+    };
+  } catch {
+    // Session identity is diagnostic metadata; retain the cwd fallback below.
+    return {};
+  }
+}
+
+function resolveWebSession(ctx: WebInterviewContext): { sessionId?: string; piSessionId?: string; piSessionFile?: string } {
+  const { piSessionId, piSessionFile } = sessionIdentity(ctx);
+  const sessionId =
+    mapSessionId("__pi_interview_pi_sessions", piSessionId) ??
+    mapSessionId("__pi_interview_session_files", piSessionFile) ??
+    mapSessionId("__pi_interview_cwd_sessions", ctx.cwd);
+  return { sessionId, piSessionId, piSessionFile };
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +154,7 @@ const QuestionSchema = Type.Object({
   ),
   prompt: Type.String({ description: "The full question text to display" }),
   options: Type.Array(QuestionOptionSchema, { description: "Available options to choose from" }),
-  allowOther: Type.Optional(Type.Boolean({ description: "Allow 'Type something' option (default: true)" })),
+  allowOther: Type.Optional(Type.Boolean({ description: "Deprecated and ignored; free-text entry is always available." })),
 });
 
 const InterviewParams = Type.Object({
@@ -107,7 +171,7 @@ function errorResult(message: string, questions: Question[] = []): {
 } {
   return {
     content: [{ type: "text", text: message }],
-    details: { questions, answers: [], cancelled: true },
+    details: { questions, answers: [], status: "error", cancelled: false, error: message },
   };
 }
 
@@ -117,7 +181,8 @@ function normalizeParams(rawQuestions: any[]): Question[] {
     label: q.label || `Q${i + 1}`,
     prompt: q.prompt || q.question || "",
     options: Array.isArray(q.options) ? q.options : [],
-    allowOther: q.allowOther !== false,
+    // Retain the field for bridge/schema compatibility, but never disable free text.
+    allowOther: true,
   }));
 }
 
@@ -157,8 +222,20 @@ async function tuiInterview(
       tui.requestRender();
     }
 
+    function orderedAnswers(): Answer[] {
+      return questions
+        .map((question) => answers.get(question.id))
+        .filter((answer): answer is Answer => answer !== undefined);
+    }
+
     function submit(cancelled: boolean) {
-      done({ questions, answers: Array.from(answers.values()), cancelled });
+      done({
+        questions,
+        // Navigation can answer questions out of order; preserve question order in results.
+        answers: orderedAnswers(),
+        status: cancelled ? "cancelled" : "submitted",
+        cancelled,
+      });
     }
 
     function currentQuestion(): Question | undefined {
@@ -168,11 +245,7 @@ async function tuiInterview(
     function currentOptions(): RenderOption[] {
       const q = currentQuestion();
       if (!q) return [];
-      const opts: RenderOption[] = [...q.options];
-      if (q.allowOther) {
-        opts.push({ value: "__other__", label: "Type something.", isOther: true });
-      }
-      return opts;
+      return [...q.options, { value: "__other__", label: "Type something.", isOther: true }];
     }
 
     function allAnswered(): boolean {
@@ -391,28 +464,57 @@ async function tuiInterview(
 // Web/SDK mode — event bridge for WebSocket relay
 // ---------------------------------------------------------------------------
 
-async function webInterview(questions: Question[], cwd: string): Promise<InterviewResult> {
-  try {
-    const bridge = getBridge();
-    const cwdMap = (globalThis as any).__pi_interview_cwd_sessions as Map<string, string> | undefined;
-    const sessionId = (cwdMap && cwd) ? cwdMap.get(cwd) : undefined;
-    if (!sessionId) {
-      return { questions, answers: [], cancelled: true };
-    }
-    const answers = await bridge.createRequest(sessionId, questions, 120_000);
+async function webInterview(questions: Question[], toolCallId: string, ctx: WebInterviewContext): Promise<InterviewResult> {
+  const { sessionId, piSessionId, piSessionFile } = resolveWebSession(ctx);
+  if (!sessionId) {
     return {
       questions,
-      answers: answers.map((a: any) => ({
-        id: a.id,
-        value: a.value,
-        label: a.label,
-        wasCustom: a.wasCustom || false,
-        index: a.index,
-      })),
-      cancelled: answers.length === 0,
+      answers: [],
+      status: "error",
+      cancelled: false,
+      error: "Interview bridge has no Wayang session mapping for this pi session.",
     };
-  } catch {
-    return { questions, answers: [], cancelled: true };
+  }
+
+  try {
+    const outcome = await getBridge().createRequestWithOutcome(sessionId, questions, {
+      toolName: "interview",
+      toolCallId,
+      piSessionId,
+      piSessionFile,
+      timeoutMs: 120_000,
+    });
+    const requestId = outcome.request.requestId;
+    if (typeof requestId !== "string" || !requestId) {
+      throw new Error("Interview bridge returned an outcome without durable request provenance.");
+    }
+    const submissionId = outcome.status === "submitted" ? outcome.submission?.submissionId : undefined;
+    if (outcome.status === "submitted" && (typeof submissionId !== "string" || !submissionId)) {
+      throw new Error("Interview bridge returned a submitted outcome without durable submission provenance.");
+    }
+    const answers = (outcome.status === "submitted" ? outcome.answers ?? [] : []).map((a: any) => ({
+      id: a.id,
+      value: a.value,
+      label: a.label,
+      wasCustom: a.wasCustom || false,
+      index: a.index,
+    }));
+    return {
+      questions,
+      answers,
+      status: outcome.status,
+      cancelled: outcome.status === "cancelled",
+      requestId,
+      submissionId,
+    };
+  } catch (error) {
+    return {
+      questions,
+      answers: [],
+      status: "error",
+      cancelled: false,
+      error: error instanceof Error ? error.message : "Interview bridge request failed.",
+    };
   }
 }
 
@@ -428,7 +530,7 @@ export default function interview(pi: ExtensionAPI) {
       "Ask the user one or more questions with navigation between them. Use when clarifying requirements, getting preferences, or confirming decisions on new features. Questions can be multiple-choice (select from options) or free-text (allowOther).",
     parameters: InterviewParams,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.questions.length === 0) {
         return errorResult("Error: No questions provided");
       }
@@ -442,7 +544,7 @@ export default function interview(pi: ExtensionAPI) {
       }
 
       // Web/SDK mode
-      const result = await webInterview(questions, ctx.cwd);
+      const result = await webInterview(questions, toolCallId, ctx);
       return formatResult(result);
     },
 
@@ -463,6 +565,12 @@ export default function interview(pi: ExtensionAPI) {
       if (!details) {
         const text = result.content[0];
         return new Text(text?.type === "text" ? text.text : "", 0, 0);
+      }
+      if (details.status === "error") {
+        return new Text(theme.fg("error", details.error || "Interview bridge error"), 0, 0);
+      }
+      if (details.status === "pending") {
+        return new Text(theme.fg("warning", "Pending — a later submission will arrive as a Wayang message"), 0, 0);
       }
       if (details.cancelled) {
         return new Text(theme.fg("warning", "Cancelled"), 0, 0);
@@ -487,6 +595,24 @@ function formatResult(result: InterviewResult): {
   content: { type: "text"; text: string }[];
   details: InterviewResult;
 } {
+  if (result.status === "error") {
+    return {
+      content: [{ type: "text", text: `Interview bridge error: ${result.error || "request failed"}` }],
+      details: result,
+    };
+  }
+
+  if (result.status === "pending") {
+    const request = result.requestId ? ` (request ${result.requestId})` : "";
+    return {
+      content: [{
+        type: "text",
+        text: `The interview remains open${request}. Do not treat this as cancelled; a later submission will arrive as a wayang-interview-submission message.`,
+      }],
+      details: result,
+    };
+  }
+
   if (result.cancelled) {
     return {
       content: [{ type: "text", text: "User cancelled the interview" }],
@@ -501,9 +627,12 @@ function formatResult(result: InterviewResult): {
     }
     return `${qLabel}: user selected: ${a.index}. ${a.label}`;
   });
+  const provenanceLine = result.requestId && result.submissionId
+    ? `Interview submitted (request ID ${JSON.stringify(result.requestId)}, submission ID ${JSON.stringify(result.submissionId)}).`
+    : undefined;
 
   return {
-    content: [{ type: "text", text: answerLines.join("\n") }],
+    content: [{ type: "text", text: [provenanceLine, ...answerLines].filter(Boolean).join("\n") }],
     details: result,
   };
 }

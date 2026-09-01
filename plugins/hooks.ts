@@ -2,7 +2,7 @@
  * Hooks Extension — Reminders injected at specific lifecycle points.
  *
  * Hooks are defined in .pi/hooks.json (project) or ~/.pi/agent/hooks.json (global).
- * Each hook has a `trigger` (lifecycle point), a `message`, and optional conditions.
+ * Each hook has a `trigger` (lifecycle point), an optional `message`, optional `todos`, and optional conditions.
  *
  * Trigger points:
  *   session_start    — inject a message once when a session starts (any reason)
@@ -17,7 +17,8 @@
  *   "hooks": [
  *     { "name": "venv", "trigger": "session_start", "message": "Always activate venv first." },
  *     { "name": "test", "trigger": "every_n_turns", "every": 5, "message": "Have you run the tests?" },
- *     { "name": "concise", "trigger": "every_turn", "message": "Keep responses concise." }
+ *     { "name": "concise", "trigger": "every_turn", "message": "Keep responses concise." },
+ *     { "name": "session-end", "trigger": "session_start", "todos": [{ "text": "Journal at session end" }] }
  *   ]
  * }
  */
@@ -29,10 +30,21 @@ import * as path from "node:path";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
+interface HookTodoSeed {
+	text: string;
+	priority?: "low" | "medium" | "high" | "critical";
+	status?: "pending" | "in_progress" | "done" | "blocked" | "cancelled";
+	assignee?: string;
+	notes?: string;
+}
+
 interface HookDefinition {
 	name: string;
 	trigger: "session_start" | "new_session" | "every_turn" | "every_n_turns" | "after_tool" | "on_command";
-	message: string;
+	/** Optional reminder text to inject/display when the hook fires. */
+	message?: string;
+	/** Optional TODOs to preseed via the todo extension when the hook fires. */
+	todos?: HookTodoSeed[];
 	/** For every_n_turns: fire every N turns (default 5) */
 	every?: number;
 	/** For after_tool: tool name(s) that trigger this hook */
@@ -103,8 +115,41 @@ function matchesInput(hook: HookDefinition, text: string): boolean {
 	return text.toLowerCase().includes(hook.match.toLowerCase());
 }
 
-function formatHookReminder(hook: HookDefinition): string {
+function formatHookReminder(hook: HookDefinition): string | undefined {
+	if (!hook.message) return undefined;
 	return `\n[Hook: ${hook.name}] ${hook.message}`;
+}
+
+function preseedTodos(pi: ExtensionAPI, hook: HookDefinition): void {
+	const todos = hook.todos?.filter((todo) => typeof todo.text === "string" && todo.text.trim().length > 0);
+	if (!todos || todos.length === 0) return;
+	pi.appendEntry("todo-preseed", {
+		hook: hook.name,
+		trigger: hook.trigger,
+		todos: todos.map((todo) => ({ ...todo, text: todo.text.trim() })),
+	});
+}
+
+function sendHookMessage(pi: ExtensionAPI, hook: HookDefinition): void {
+	if (!hook.message) return;
+	pi.sendMessage({
+		customType: "hook",
+		content: hook.message,
+		display: true,
+		details: { hook: hook.name, trigger: hook.trigger },
+	});
+}
+
+function fireSessionHook(pi: ExtensionAPI, hook: HookDefinition): void {
+	preseedTodos(pi, hook);
+	sendHookMessage(pi, hook);
+}
+
+function hookSummary(hook: HookDefinition): string {
+	if (hook.message) return hook.message;
+	const count = hook.todos?.length ?? 0;
+	if (count > 0) return `Preseed ${count} TODO${count === 1 ? "" : "s"}`;
+	return "(no action)";
 }
 
 function stashTurns(turnOffsets: Map<string, number>): [string, number][] {
@@ -144,6 +189,16 @@ function loadUsage(raw: unknown): Record<string, number> {
 	return {};
 }
 
+function createInitialState(): HookState {
+	return {
+		turnCount: 0,
+		toolsThisTurn: [],
+		toolUsage: {},
+		firedOnce: new Set(),
+		turnOffsets: new Map(),
+	};
+}
+
 // ── State persistence via session entries ───────────────────────────────────
 
 function persistState(pi: ExtensionAPI, state: HookState): void {
@@ -156,13 +211,7 @@ function persistState(pi: ExtensionAPI, state: HookState): void {
 }
 
 function restoreState(ctx: ExtensionContext): HookState {
-	const state: HookState = {
-		turnCount: 0,
-		toolsThisTurn: [],
-		toolUsage: {},
-		firedOnce: new Set(),
-		turnOffsets: new Map(),
-	};
+	const state = createInitialState();
 
 	for (const entry of ctx.sessionManager.getEntries()) {
 		if (entry.type === "custom" && (entry as any).customType === "hooks-state" && (entry as any).data) {
@@ -189,7 +238,8 @@ function collectTurnReminders(
 	for (const hook of config.hooks) {
 		switch (hook.trigger) {
 			case "every_turn": {
-				reminders.push(formatHookReminder(hook));
+				const reminder = formatHookReminder(hook);
+				if (reminder) reminders.push(reminder);
 				break;
 			}
 
@@ -198,7 +248,8 @@ function collectTurnReminders(
 				const id = hookId(hook);
 				const offset = state.turnOffsets.get(id) ?? 0;
 				if ((state.turnCount - offset) % every === 0 && state.turnCount > 0) {
-					reminders.push(formatHookReminder(hook));
+					const reminder = formatHookReminder(hook);
+					if (reminder) reminders.push(reminder);
 				}
 				break;
 			}
@@ -209,7 +260,8 @@ function collectTurnReminders(
 					tools.some((target) => t === target || t.startsWith(target)),
 				);
 				if (matched) {
-					reminders.push(formatHookReminder(hook));
+					const reminder = formatHookReminder(hook);
+					if (reminder) reminders.push(reminder);
 				}
 				break;
 			}
@@ -219,7 +271,8 @@ function collectTurnReminders(
 				if (hook.once && state.firedOnce.has(hookId(hook))) break;
 				if (matchesInput(hook, userInput)) {
 					if (hook.once) state.firedOnce.add(hookId(hook));
-					reminders.push(formatHookReminder(hook));
+					const reminder = formatHookReminder(hook);
+					if (reminder) reminders.push(reminder);
 				}
 				break;
 			}
@@ -238,7 +291,7 @@ function collectTurnReminders(
 
 export default function (pi: ExtensionAPI) {
 	let config: HooksConfig = { hooks: [] };
-	let state!: HookState;
+	let state: HookState = createInitialState();
 
 	const reloadConfig = (cwd: string) => {
 		config = loadConfig(cwd);
@@ -264,23 +317,13 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Loaded ${config.hooks.length} hook(s)`, "info");
 		}
 
-		// Inject session_start / new_session hooks as visible custom messages
+		// Fire session_start / new_session hooks. Hooks may display messages and/or preseed TODOs.
 		for (const hook of config.hooks) {
 			if (hook.trigger === "session_start") {
-				pi.sendMessage({
-					customType: "hook",
-					content: hook.message,
-					display: true,
-					details: { hook: hook.name, trigger: hook.trigger },
-				});
+				fireSessionHook(pi, hook);
 			}
 			if (hook.trigger === "new_session" && event.reason === "new") {
-				pi.sendMessage({
-					customType: "hook",
-					content: hook.message,
-					display: true,
-					details: { hook: hook.name, trigger: hook.trigger },
-				});
+				fireSessionHook(pi, hook);
 			}
 		}
 	});
@@ -333,10 +376,11 @@ export default function (pi: ExtensionAPI) {
 				const lines = config.hooks.map((h) => {
 					const trig = theme.fg("accent", h.trigger.padEnd(18));
 					const name = theme.fg("text", h.name.padEnd(24));
+					const summary = hookSummary(h);
 					const msg =
-						h.message.length > 60
-							? theme.fg("muted", h.message.slice(0, 57) + "...")
-							: theme.fg("muted", h.message);
+						summary.length > 60
+							? theme.fg("muted", summary.slice(0, 57) + "...")
+							: theme.fg("muted", summary);
 					return `  ${trig} ${name} ${msg}`;
 				});
 

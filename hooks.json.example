@@ -3,7 +3,20 @@
     {
       "name": "session-end-checklist",
       "trigger": "session_start",
-      "message": "End-of-session checklist — this is injected at session start, but the items are meant to be done at THE END, after the user's final request is fully handled and just before you would otherwise stop responding. Do NOT act on these now. Remember them, then work through them at session end:\n\n- [ ] Journal the results of this session if something significant happened\n  - [ ] *If this session resulted in the creation or modification of pi extensions/features, don't forget to install them to the user's pi context (~/.pi/agent/extensions, /agents, /teams)*"
+      "todos": [
+        {
+          "text": "End of session: Journal the results unless this was only a quick change, simple answer, or mechanical data transformation.",
+          "priority": "medium",
+          "assignee": "session-end-checklist",
+          "notes": "Journal when machine configuration changed, pi context was installed/modified, or development progress was made. For development work, create/use a project journal (for example docs/journals/). Use Memoriki/MemPalace for durable personal/tooling knowledge. If both project context and durable personal/tooling knowledge were created, journal in both places and report the path/entry id."
+        },
+        {
+          "text": "End of session: Release any active session_coordination claims/locks that are no longer needed.",
+          "priority": "medium",
+          "assignee": "session-end-checklist",
+          "notes": "Use session_coordination status to review claims owned by this session, then session_coordination release for completed or abandoned path/task claims. Leave only intentionally persistent claims with a note."
+        }
+      ]
     }
   ]
 }

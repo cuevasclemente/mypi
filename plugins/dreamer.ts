@@ -10,27 +10,37 @@
  * Triggered by a cron job at 9am PST daily, or manually via /dream command.
  *
  * Architecture:
- *   - Extension does bookkeeping: session discovery, batching, state tracking
- *   - Agent does creative work: subagent orchestration, pattern discovery,
- *     skill creation, file writing
+ *   - Extension performs runner-authorized discovery, batching, and state setup
+ *   - The Dream orchestrator reads authorized transcript segments through the
+ *     dedicated runner tool, finds patterns, and creates selected skills
  *
- * Phases (executed by the agent via subagents):
- *   1. Cheap subagents scan session batches for important workflows
- *   2. Orchestrator synthesizes findings, decides which merit skills
- *   3. Expensive subagent(s) create SKILL.md files for selected patterns
- *   4. Skills written to all 3 locations, state file updated
+ * Phases:
+ *   1. The orchestrator scans authorized session batches
+ *   2. It synthesizes findings and decides which merit skills
+ *   3. It drafts selected SKILL.md files without delegating transcript access
+ *   4. Skills are written to all 3 locations and state is updated
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { spawnSync } from "node:child_process";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-const SESSIONS_DIR = path.join(os.homedir(), ".pi/agent/sessions");
-const STATE_FILE = path.join(os.homedir(), ".pi/agent/dreamer-state.json");
+const SESSIONS_DIR = process.env.PI_DREAM_SESSIONS_DIR
+	|| path.join(os.homedir(), ".pi/agent/sessions");
+const STATE_FILE = process.env.PI_DREAM_STATE_FILE
+	|| path.join(os.homedir(), ".pi/agent/dreamer-state.json");
+const AUTHORIZATION_RUNNER = process.env.PI_DREAM_AUTHORIZATION_RUNNER
+	|| path.join(os.homedir(), ".pi/agent/scripts/dream-authorized-sessions.mjs");
+const AUTHORIZATION_PROJECTION = process.env.WAYANG_PROJECT_POLICY_PROJECTION;
+const MAX_RUNNER_OUTPUT_BYTES = 128 * 1024 * 1024;
+const MAX_DREAM_TOOL_LINES = 500;
+const MAX_DREAM_TOOL_BYTES = 48 * 1024;
 const SKILL_LOCATIONS = [
 	path.join(os.homedir(), ".pi/agent/skills"),
 	path.join(os.homedir(), "src/mypi/skills"),
@@ -115,119 +125,130 @@ function saveState(state: DreamerState): void {
 
 // ── Session Discovery ───────────────────────────────────────────────────────
 
-/** Extract the project name from a session directory name */
-function projectFromDir(dirName: string): string {
-	// dirName is like "--home-clemente-src-memoriki--"
-	const cleaned = dirName.replace(/^--?/, "").replace(/--?$/, "").replace(/--/g, "/");
-	// Handle home directory
-	const home = os.homedir();
-	if (cleaned.startsWith(home)) return cleaned.slice(home.length + 1) || "~";
-	// Handle other patterns
-	const parts = cleaned.split("/").filter(Boolean);
-	return parts.join("/") || cleaned;
+export class DreamAuthorizationDeniedError extends Error {
+	readonly code = "DREAM_POLICY_DENIED";
+	constructor(message: string) {
+		super(message);
+		this.name = "DreamAuthorizationDeniedError";
+	}
 }
 
-/** Read just enough of a session JSONL to extract metadata */
-function extractSessionMeta(filePath: string, fileName: string, mtime: number): SessionMeta | null {
+function runnerArgs(command: "list" | "read", sessionPath?: string): string[] {
+	const args = [AUTHORIZATION_RUNNER, command, "--sessions-root", SESSIONS_DIR];
+	if (sessionPath) args.push("--session", sessionPath);
+	if (AUTHORIZATION_PROJECTION) args.push("--projection", AUTHORIZATION_PROJECTION);
+	return args;
+}
+
+function invokeAuthorizationRunner(command: "list" | "read", sessionPath?: string): Buffer {
+	const result = spawnSync(process.execPath, runnerArgs(command, sessionPath), {
+		encoding: null,
+		maxBuffer: MAX_RUNNER_OUTPUT_BYTES,
+	});
+	if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
+		throw new DreamAuthorizationDeniedError(
+			`Dream authorization runner denied ${command}; no direct session fallback is permitted`,
+		);
+	}
+	return result.stdout;
+}
+
+export function listAuthorizedSessionPaths(): string[] {
+	let parsed: unknown;
 	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		const lines = content.trim().split("\n");
-		if (lines.length === 0) return null;
+		parsed = JSON.parse(invokeAuthorizationRunner("list").toString("utf8"));
+	} catch (error) {
+		if (error instanceof DreamAuthorizationDeniedError) throw error;
+		throw new DreamAuthorizationDeniedError("Dream authorization runner returned malformed list output");
+	}
+	if (!parsed || typeof parsed !== "object"
+		|| (parsed as any).schema_version !== 1
+		|| !Number.isInteger((parsed as any).generation)
+		|| !Array.isArray((parsed as any).sessions)) {
+		throw new DreamAuthorizationDeniedError("Dream authorization runner returned unsupported list output");
+	}
+	const sessions = (parsed as any).sessions as unknown[];
+	if (sessions.some((entry) => typeof entry !== "string" || !path.isAbsolute(entry))) {
+		throw new DreamAuthorizationDeniedError("Dream authorization runner returned an invalid session path");
+	}
+	if (new Set(sessions as string[]).size !== sessions.length) {
+		throw new DreamAuthorizationDeniedError("Dream authorization runner returned ambiguous session paths");
+	}
+	return [...sessions as string[]];
+}
 
-		const header = JSON.parse(lines[0]);
-		if (header.type !== "session") return null;
+export function readAuthorizedSessionBytes(sessionPath: string): Buffer {
+	return invokeAuthorizationRunner("read", sessionPath);
+}
 
-		const cwd = header.cwd ?? "unknown";
-		const project = cwd.replace(os.homedir(), "~");
+/** Parse metadata only from bytes returned by the authorization runner. */
+export function extractAuthorizedSessionMeta(
+	filePath: string,
+	fileName: string,
+	mtime: number,
+): SessionMeta | null {
+	const content = readAuthorizedSessionBytes(filePath).toString("utf8");
+	const lines = content.trim().split("\n");
+	if (lines.length === 0) return null;
 
-		let firstUserMessage = "";
-		let messageCount = 0;
-		const toolNames = new Set<string>();
+	let header: any;
+	try { header = JSON.parse(lines[0]); } catch { return null; }
+	if (header.type !== "session") return null;
 
-		for (let i = 1; i < lines.length; i++) {
-			try {
-				const entry = JSON.parse(lines[i]);
-				if (entry.type === "message") {
-					messageCount++;
-					const msg = entry.message;
-					if (msg?.role === "user" && !firstUserMessage) {
-						if (Array.isArray(msg.content)) {
-							for (const block of msg.content) {
-								if (block.type === "text" && block.text) {
-									firstUserMessage = block.text.slice(0, 200);
-									break;
-								}
-							}
-						} else if (typeof msg.content === "string") {
-							firstUserMessage = msg.content.slice(0, 200);
+	const cwd = typeof header.cwd === "string" ? header.cwd : "unknown";
+	const project = cwd.replace(os.homedir(), "~");
+	let firstUserMessage = "";
+	let messageCount = 0;
+	const toolNames = new Set<string>();
+
+	for (let i = 1; i < lines.length; i++) {
+		try {
+			const entry = JSON.parse(lines[i]);
+			if (entry.type !== "message") continue;
+			messageCount++;
+			const msg = entry.message;
+			if (msg?.role === "user" && !firstUserMessage) {
+				if (Array.isArray(msg.content)) {
+					for (const block of msg.content) {
+						if (block.type === "text" && block.text) {
+							firstUserMessage = block.text.slice(0, 200);
+							break;
 						}
 					}
-					// Collect tool names from toolResult messages
-					if (msg?.role === "toolResult" && msg.toolName) {
-						toolNames.add(msg.toolName);
-					}
+				} else if (typeof msg.content === "string") {
+					firstUserMessage = msg.content.slice(0, 200);
 				}
-			} catch {
-				// Skip malformed lines
 			}
+			if (msg?.role === "toolResult" && msg.toolName) toolNames.add(msg.toolName);
+		} catch {
+			// Individual malformed JSONL entries do not change runner authorization.
 		}
-
-		return {
-			filePath,
-			fileName,
-			mtime,
-			mtimeStr: new Date(mtime).toISOString(),
-			cwd,
-			project,
-			firstUserMessage,
-			messageCount,
-			toolNames: [...toolNames].sort(),
-		};
-	} catch (err) {
-		console.error(`[dreamer] Failed to extract meta from ${filePath}:`, err);
-		return null;
 	}
+
+	return {
+		filePath,
+		fileName,
+		mtime,
+		mtimeStr: new Date(mtime).toISOString(),
+		cwd,
+		project,
+		firstUserMessage,
+		messageCount,
+		toolNames: [...toolNames].sort(),
+	};
 }
 
-/** Discover all session files and their metadata */
-function discoverSessions(): SessionMeta[] {
+/** Discover only paths explicitly allowed by one complete Wayang projection. */
+export function discoverSessions(): SessionMeta[] {
 	const sessions: SessionMeta[] = [];
-
-	if (!fs.existsSync(SESSIONS_DIR)) {
-		console.error("[dreamer] Sessions directory not found:", SESSIONS_DIR);
-		return sessions;
+	for (const filePath of listAuthorizedSessionPaths()) {
+		let stat: fs.Stats;
+		try { stat = fs.statSync(filePath); }
+		catch { throw new DreamAuthorizationDeniedError("An authorized Dream session became unavailable"); }
+		const meta = extractAuthorizedSessionMeta(filePath, path.basename(filePath), stat.mtimeMs);
+		if (meta) sessions.push(meta);
 	}
-
-	const dirs = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })
-		.filter((d) => d.isDirectory())
-		.map((d) => d.name);
-
-	for (const dirName of dirs) {
-		const dirPath = path.join(SESSIONS_DIR, dirName);
-		let files: string[];
-		try {
-			files = fs.readdirSync(dirPath).filter((f) => f.endsWith(".jsonl"));
-		} catch {
-			continue;
-		}
-
-		for (const file of files) {
-			const filePath = path.join(dirPath, file);
-			let stat: fs.Stats;
-			try {
-				stat = fs.statSync(filePath);
-			} catch {
-				continue;
-			}
-
-			const meta = extractSessionMeta(filePath, file, stat.mtimeMs);
-			if (meta) sessions.push(meta);
-		}
-	}
-
-	// Sort by modification time, newest first
 	sessions.sort((a, b) => b.mtime - a.mtime);
-
 	return sessions;
 }
 
@@ -241,11 +262,13 @@ function findUnprocessed(sessions: SessionMeta[], state: DreamerState): SessionM
 
 	const lastRunTime = new Date(state.lastRun).getTime();
 
-	// Find sessions modified after last run
+	// Any authorized path absent from state remains eligible regardless of the
+	// last-run timestamp. This is essential for sessions that were previously
+	// denied and later made eligible by an explicit policy relaxation.
 	const newSessions = sessions.filter((s) => {
 		const processed = state.processedSessions[s.filePath];
-		if (!processed) return s.mtime > lastRunTime;
-		// Session was processed but has been modified since
+		if (!processed) return true;
+		// Session was processed but has been modified since.
 		return s.mtime > Math.max(processed.mtime, lastRunTime);
 	});
 
@@ -330,10 +353,11 @@ function buildDreamContext(
 	lines.push("## Instructions");
 	lines.push("");
 
-	lines.push("### Phase 1: Session Analysis (Cheap Subagents)");
+	lines.push("### Phase 1: Session Analysis (Runner-backed orchestrator)");
 	lines.push("");
-	lines.push("For each batch above, spawn a **cheap subagent** (use `model: \"anthropic/claude-haiku-4-5\"` or `\"openai/gpt-4o-mini\"`).");
-	lines.push("Each subagent should read ALL session files in its batch using the `read` tool. For each session, identify:");
+	lines.push("Analyze each batch directly in this Dream orchestrator using only `dream_session_read`, continuing with `offset` until every authorized session is complete.");
+	lines.push("Do not spawn analysis children: Agent Teams deliberately disables general extension discovery and custom tools in hardened children, so `dream_session_read` is available only in this reviewed Dream runtime.");
+	lines.push("Never use `read`, `bash`, `sudo_exec`, or other direct filesystem/process tools for transcript bytes. For each session, identify:");
 	lines.push("");
 	lines.push("1. **Primary task** — what was the user trying to accomplish?");
 	lines.push("2. **Key workflows** — what sequences of actions were performed?");
@@ -355,9 +379,9 @@ function buildDreamContext(
 	lines.push("4. Rate each candidate: **create**, **merge** (with existing), or **skip**.");
 	lines.push("");
 
-	lines.push("### Phase 3: Skill Creation (Expensive Subagent)");
+	lines.push("### Phase 3: Skill Creation (Dream Orchestrator)");
 	lines.push("");
-	lines.push("For each skill you decide to CREATE, spawn an **expensive subagent** (use `model: \"anthropic/claude-sonnet-4-5\"` or your best available model) to generate the SKILL.md.");
+	lines.push("For each skill you decide to CREATE, draft the SKILL.md directly from the authorized analysis already in this context. Do not delegate transcript-derived work to another process.");
 	lines.push("");
 	lines.push("**Skill requirements:**");
 	lines.push("- Follow the [Agent Skills spec](https://agentskills.io/specification)");
@@ -390,8 +414,11 @@ function buildDreamContext(
 
 	lines.push("## Important Notes");
 	lines.push("");
+	lines.push("- **Runner-only transcript access is mandatory** — never use `read`, `bash`, `grep`, `find`, `ls`, or `sudo_exec` on the Pi sessions tree");
+	lines.push("- **Fail closed** — if `dream_session_read` denies a path, do not retry it through another tool and do not mark it processed");
+	lines.push("- **Denied/unknown sessions remain unprocessed** so a later explicit policy relaxation can make them eligible");
 	lines.push("- **Do NOT read the state file for API keys or secrets** — it only contains session metadata");
-	lines.push("- **Batch subagents can run in parallel** — spawn all batch readers at once, then collect results");
+	lines.push("- **Analyze bounded batches directly** — keep reports concise and synthesize after all authorized reads complete");
 	lines.push("- **Skill names must be valid** — kebab-case, lowercase letters/numbers/hyphens only, match directory name");
 	lines.push("- **Avoid duplicates** — check the Skills Index before creating a skill that already exists");
 	lines.push("- **Be selective** — not every session warrants a skill. Only extract genuinely reusable patterns.");
@@ -437,10 +464,153 @@ function prepareDreamContext(): DreamContext {
 	};
 }
 
+function dreamToolSlice(bytes: Buffer, offset: number, limit: number): {
+	text: string;
+	nextOffset: number | null;
+	totalLines: number;
+} {
+	const lines = bytes.toString("utf8").split("\n");
+	const start = Math.max(0, offset - 1);
+	const requested = lines.slice(start, start + Math.max(1, Math.min(limit, MAX_DREAM_TOOL_LINES)));
+	const selected: string[] = [];
+	let used = 0;
+	for (const line of requested) {
+		const size = Buffer.byteLength(line, "utf8") + 1;
+		if (selected.length > 0 && used + size > MAX_DREAM_TOOL_BYTES) break;
+		selected.push(line);
+		used += size;
+	}
+	const consumed = selected.length;
+	const next = start + consumed < lines.length ? start + consumed + 1 : null;
+	return { text: selected.join("\n"), nextOffset: next, totalLines: lines.length };
+}
+
+function pathWithin(target: string, root: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function canonicalizeDreamToolPath(rawPath: unknown, cwd: string): string {
+	const requested = typeof rawPath === "string" && rawPath.trim()
+		? rawPath.trim().replace(/^@/, "")
+		: cwd;
+	const absolute = path.resolve(cwd, requested);
+	try { return fs.realpathSync.native(absolute); } catch { /* resolve nearest existing parent below */ }
+
+	const missing: string[] = [];
+	let cursor = absolute;
+	while (!fs.existsSync(cursor)) {
+		try {
+			if (fs.lstatSync(cursor).isSymbolicLink()) {
+				throw new DreamAuthorizationDeniedError("Dream direct-tool path contains an unresolved symlink");
+			}
+		} catch (error) {
+			if (error instanceof DreamAuthorizationDeniedError) throw error;
+		}
+		const parent = path.dirname(cursor);
+		if (parent === cursor) {
+			throw new DreamAuthorizationDeniedError("Dream direct-tool path has no existing parent");
+		}
+		missing.unshift(path.basename(cursor));
+		cursor = parent;
+	}
+	let parentReal: string;
+	try { parentReal = fs.realpathSync.native(cursor); }
+	catch { throw new DreamAuthorizationDeniedError("Dream direct-tool parent cannot be resolved"); }
+	return path.join(parentReal, ...missing);
+}
+
+export function dreamPathIntersectsSessionsTree(rawPath: unknown, cwd: string): boolean {
+	const target = canonicalizeDreamToolPath(rawPath, cwd);
+	let root: string;
+	try { root = fs.realpathSync.native(SESSIONS_DIR); }
+	catch { throw new DreamAuthorizationDeniedError("Dream sessions root is unavailable"); }
+	return pathWithin(target, root) || pathWithin(root, target);
+}
+
 // ── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	let dreamActive = false;
+	let preDreamActiveTools: string[] | null = null;
+
+	const currentToolNames = (): string[] => {
+		const active = pi.getActiveTools() as unknown;
+		if (!Array.isArray(active)) return [];
+		return [...new Set(active.map((tool) => (
+			typeof tool === "string"
+				? tool
+				: tool && typeof tool === "object" && typeof (tool as { name?: unknown }).name === "string"
+					? (tool as { name: string }).name
+					: ""
+		)).filter(Boolean))];
+	};
+	const enterDreamToolMode = (): void => {
+		if (preDreamActiveTools) return;
+		preDreamActiveTools = currentToolNames();
+		const reviewed = new Set(["dream_session_read", "read", "edit", "write"]);
+		pi.setActiveTools(preDreamActiveTools.filter((name) => reviewed.has(name)));
+	};
+	const leaveDreamToolMode = (): void => {
+		if (!preDreamActiveTools) return;
+		pi.setActiveTools(preDreamActiveTools);
+		preDreamActiveTools = null;
+	};
+
+	pi.registerTool({
+		name: "dream_session_read",
+		label: "Read Dream-Authorized Session",
+		description: [
+			"Read a bounded JSONL segment only after the Wayang authorization runner allows the session.",
+			"Missing, stale, unknown, malformed, protected, or changing policy denies with no direct fallback.",
+			`Returns at most ${MAX_DREAM_TOOL_LINES} lines and ${MAX_DREAM_TOOL_BYTES} bytes; continue with next_offset.`,
+		].join(" "),
+		promptSnippet: "Read a runner-authorized Dream session segment",
+		parameters: Type.Object({
+			path: Type.String({ description: "Absolute session JSONL path from the authorized Dream batch" }),
+			offset: Type.Optional(Type.Number({ description: "1-based line offset (default 1)" })),
+			limit: Type.Optional(Type.Number({ description: `Maximum lines (default/max ${MAX_DREAM_TOOL_LINES})` })),
+		}),
+		async execute(_toolCallId, params) {
+			const bytes = readAuthorizedSessionBytes(params.path);
+			const segment = dreamToolSlice(bytes, params.offset ?? 1, params.limit ?? MAX_DREAM_TOOL_LINES);
+			return {
+				content: [{ type: "text", text: segment.text }],
+				details: {
+					path: params.path,
+					offset: params.offset ?? 1,
+					next_offset: segment.nextOffset,
+					total_lines: segment.totalLines,
+				},
+			};
+		},
+	});
+
+	// During a Dream turn the orchestrator may use only the dedicated runner
+	// tool for transcript bytes. Child agents receive an explicit one-tool
+	// allowlist, so neither layer can fall back to direct filesystem/process IO.
+	pi.on("tool_call", async (event, ctx) => {
+		if (!dreamActive || event.toolName === "dream_session_read") return;
+		if (event.toolName === "bash" || event.toolName === "sudo_exec") {
+			return { block: true, reason: "Dream policy requires runner-only transcript access; process tools are disabled during Dream" };
+		}
+		if (["read", "grep", "find", "ls", "edit", "write"].includes(event.toolName)) {
+			try {
+				// Revalidate the complete private projection/source-store fingerprint
+				// before every remaining direct path-tool call. No stale allow survives.
+				listAuthorizedSessionPaths();
+				const input = event.input as Record<string, unknown>;
+				if (dreamPathIntersectsSessionsTree(input.path, ctx.cwd)) {
+					return { block: true, reason: "Dream policy blocks direct access or ancestor traversal into the Pi sessions tree; use dream_session_read" };
+				}
+			} catch (error) {
+				return {
+					block: true,
+					reason: error instanceof Error ? error.message : "Dream policy denied the direct path tool",
+				};
+			}
+		}
+	});
 
 	// ── /dream command — show status and optionally trigger ──────────────
 	pi.registerCommand("dream", {
@@ -567,14 +737,25 @@ export default function (pi: ExtensionAPI) {
 
 		if (!triggered) return { action: "continue" };
 
-		const dreamCtx = prepareDreamContext();
+		let dreamCtx: DreamContext;
+		try {
+			dreamCtx = prepareDreamContext();
+		} catch (error) {
+			dreamActive = false;
+			pi.sendMessage({
+				customType: "dreamer",
+				content: `Dream cycle denied before agent launch: ${error instanceof Error ? error.message : String(error)}`,
+				display: true,
+			});
+			return { action: "handled" };
+		}
 
 		if (!dreamCtx.triggered) {
-			// No unprocessed sessions — send a message and skip agent
+			// No authorized unprocessed sessions — send a message and skip agent.
 			const state = loadState();
 			pi.sendMessage({
 				customType: "dreamer",
-				content: `Dream cycle is up to date. No unprocessed sessions.\nLast run: ${state.lastRun ?? "never"}\nSkills: ${Object.keys(state.skillsIndex).length}`,
+				content: `Dream cycle is up to date. No authorized unprocessed sessions.\nLast run: ${state.lastRun ?? "never"}\nSkills: ${Object.keys(state.skillsIndex).length}`,
 				display: true,
 			});
 			dreamActive = false;
@@ -582,6 +763,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		dreamActive = true;
+		enterDreamToolMode();
 		const dreamPrompt = buildDreamContext(
 			dreamCtx.batches,
 			loadState(),
@@ -613,6 +795,7 @@ export default function (pi: ExtensionAPI) {
 		// We don't need to do anything here — the state is managed via the
 		// state file which the agent reads/writes directly.
 		dreamActive = false;
+		leaveDreamToolMode();
 	});
 
 	// ── Custom message renderer ─────────────────────────────────────────
@@ -625,5 +808,6 @@ export default function (pi: ExtensionAPI) {
 	// ── Session shutdown ────────────────────────────────────────────────
 	pi.on("session_shutdown", async () => {
 		dreamActive = false;
+		leaveDreamToolMode();
 	});
 }

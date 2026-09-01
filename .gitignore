@@ -16,3 +16,6 @@ secure_data/
 # wrapper scripts) IS tracked — only sessions/auth files are excluded.
 .pi/sessions/
 .pi/agent/
+
+# Ephemeral cross-session coordination room state
+.pi/coordination/
