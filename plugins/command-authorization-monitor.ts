@@ -95,6 +95,7 @@ const MAX_PROTECTED_ACCESS_INPUT_CHARS = 16_384;
 const MAX_PROTECTED_ACCESS_INPUT_NODES = 1_024;
 const MAX_PROTECTED_PATH_CANDIDATES = 256;
 const MAX_SYMLINK_HOPS = 32;
+const WAYANG_SESSION_OWNERSHIP_SYMBOL = Symbol.for("wayang.owned-session-managers.v1");
 
 type GuardMode = "off" | "audit" | "balanced" | "strict";
 
@@ -245,6 +246,17 @@ function getWebCommandGuardSessionId(ctx: ExtensionContext): string | null {
 
 function getWebCommandGuardIdentityBridge(): WebCommandGuardIdentityBridge | null {
 	return ((globalThis as any).__pi_command_guard_identity_bridge as WebCommandGuardIdentityBridge | undefined) ?? null;
+}
+
+/**
+ * Protected-identity/PIN access preflight belongs to Wayang's browser-mediated
+ * runtime, not to standalone Pi CLI sessions running directly for the host
+ * operator. Wayang installs this exact SessionManager witness before extension
+ * lifecycle binding. Do not infer ownership from cwd, ctx.hasUI, or ctx.mode.
+ */
+function isWayangOwnedSession(ctx: Pick<ExtensionContext, "sessionManager">): boolean {
+	const owners = (globalThis as any)[WAYANG_SESSION_OWNERSHIP_SYMBOL] as WeakSet<object> | undefined;
+	return owners instanceof WeakSet && owners.has(ctx.sessionManager as object);
 }
 
 function getWebCommandGuardApprovalBridge(): WebCommandGuardApprovalBridge | null {
@@ -2592,12 +2604,13 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		// This invariant is independent of command-guard mode and model policy.
-		// Run it for every protected tool before any local allow, raw-sudo, mode,
-		// identity challenge, or monitor-model branch.
-		const protectedFinding = protectedToolAccessFinding(event.toolName, event.input, ctx.cwd);
-		if (protectedFinding) {
-			return protectedToolDenial(protectedFinding);
+		// This Wayang-only invariant is independent of command-guard mode and model
+		// policy. Standalone Pi CLI sessions retain their ordinary host tool surface.
+		// For an exact Wayang-owned manager, run it before any local allow, raw-sudo,
+		// mode, identity challenge, or monitor-model branch.
+		if (isWayangOwnedSession(ctx)) {
+			const protectedFinding = protectedToolAccessFinding(event.toolName, event.input, ctx.cwd);
+			if (protectedFinding) return protectedToolDenial(protectedFinding);
 		}
 		if (event.toolName !== "bash") return undefined;
 
@@ -2702,6 +2715,7 @@ export default function commandAuthorizationMonitor(pi: ExtensionAPI) {
 	});
 
 	pi.on("user_bash", (event, ctx) => {
+		if (!isWayangOwnedSession(ctx)) return undefined;
 		const command = typeof event.command === "string" ? event.command : "";
 		const cwd = typeof event.cwd === "string" && event.cwd.length > 0 ? event.cwd : ctx.cwd;
 		const protectedFinding = protectedShellCommandFinding(command, cwd);

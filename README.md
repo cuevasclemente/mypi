@@ -150,6 +150,8 @@ If `command-authorization-monitor` is installed, toggle it at runtime with slash
 
 `/cmd-guard` is a shorter alias. Slash-command changes last until `/reload` or pi restarts. The status output includes the model route the guard will try; by default it tracks the active provider and falls back to `openrouter/deepseek/deepseek-v4-flash` / `deepseek/deepseek-v4-flash` when no provider-specific cheap model is known.
 
+The protected-identity/PIN tool preflight is scoped to exact SessionManager objects marked as Wayang-owned before extension binding. Standalone Pi CLI sessions do not inherit that browser-runtime restriction; their normal command-risk guard still follows the selected mode. Wayang ownership is never inferred from cwd, generic UI availability, or mode strings.
+
 You can also configure it before starting `pi`:
 
 ```bash

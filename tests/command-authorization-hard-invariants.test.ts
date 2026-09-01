@@ -12,6 +12,7 @@ import commandAuthorizationMonitor, {
 
 const CWD = "/tmp/synthetic-command-guard-project";
 const PIN_PATH = "$XDG_CONFIG_HOME/pi/command-guard-identity-pin";
+const WAYANG_SESSION_OWNERSHIP_SYMBOL = Symbol.for("wayang.owned-session-managers.v1");
 
 test("pure classifiers deny PIN, broad environment, protected path, raw sudo, and wrappers", () => {
 	assert.equal(protectedPathScopeRequested(PIN_PATH, CWD), true);
@@ -57,20 +58,27 @@ function registeredHandlers() {
 }
 
 function hookContext() {
+	const sessionManager = {
+		getBranch: () => [],
+		getSessionId: () => undefined,
+		getSessionFile: () => undefined,
+	};
+	const globals = globalThis as any;
+	const owners = globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] instanceof WeakSet
+		? globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] as WeakSet<object>
+		: new WeakSet<object>();
+	owners.add(sessionManager);
+	globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] = owners;
 	return {
 		cwd: CWD,
 		hasUI: false,
 		model: undefined,
 		modelRegistry: { find: () => undefined },
-		sessionManager: {
-			getBranch: () => [],
-			getSessionId: () => undefined,
-			getSessionFile: () => undefined,
-		},
+		sessionManager,
 	} as any;
 }
 
-test("hard controls run before mode, tool, local allow, and model branches", async () => {
+test("Wayang hard controls run before mode, tool, local allow, and model branches", async () => {
 	const previousMode = process.env.PI_COMMAND_GUARD_MODE;
 	process.env.PI_COMMAND_GUARD_MODE = "off";
 	try {
@@ -120,7 +128,7 @@ test("residual hook path fails closed when every model is unavailable", async ()
 	}
 });
 
-test("direct user_bash cannot bypass protected-access enforcement", () => {
+test("direct Wayang user_bash cannot bypass protected-access enforcement", () => {
 	const handlers = registeredHandlers();
 	const userBash = handlers.get("user_bash")?.[0];
 	assert.ok(userBash);

@@ -10,12 +10,13 @@ const DENIAL = "Protected identity configuration is unavailable to agent tools."
 const UNRESOLVED_DENIAL =
 	"Command contains an unresolved operational shell expansion; use a literal path or an explicitly supported variable form.";
 const RAW_SUDO_DENIAL = "Raw sudo is disabled; use sudo_exec with an absolute executable path and exact argv.";
+const WAYANG_SESSION_OWNERSHIP_SYMBOL = Symbol.for("wayang.owned-session-managers.v1");
 const MODES = ["off", "audit", "balanced", "strict"] as const;
 const TOOL_NAMES = ["bash", "read", "grep", "find", "ls", "write", "edit", "sudo_exec"] as const;
 
 type Handler = (event: any, ctx: any) => Promise<any> | any;
 
-function createHarness(cwd: string) {
+function createHarness(cwd: string, runtime: "wayang" | "cli" = "wayang") {
 	const handlers = new Map<string, Handler[]>();
 	let modelLookups = 0;
 	const pi: any = {
@@ -27,9 +28,23 @@ function createHarness(cwd: string) {
 		sendMessage() {},
 	};
 	commandAuthorizationMonitor(pi);
+	const sessionManager = {
+		getBranch: () => [],
+		getSessionFile: () => undefined,
+		getSessionId: () => undefined,
+	};
+	if (runtime === "wayang") {
+		const globals = globalThis as any;
+		const owners = globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] instanceof WeakSet
+			? globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] as WeakSet<object>
+			: new WeakSet<object>();
+		owners.add(sessionManager);
+		globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] = owners;
+	}
 	const ctx: any = {
 		cwd,
 		hasUI: false,
+		mode: runtime === "wayang" ? "rpc" : "tui",
 		model: { provider: "test", id: "test" },
 		modelRegistry: {
 			find() {
@@ -37,11 +52,7 @@ function createHarness(cwd: string) {
 				return undefined;
 			},
 		},
-		sessionManager: {
-			getBranch: () => [],
-			getSessionFile: () => undefined,
-			getSessionId: () => undefined,
-		},
+		sessionManager,
 	};
 
 	return {
@@ -106,7 +117,64 @@ function assertGenericUserBashDenial(
 	assert.equal(modelLookups, 0, "denial must not route to a guard model");
 }
 
-test("PIN path invariant is unconditional across modes, tools, and direct/relative/ancestor/glob scopes", async () => {
+test("standalone Pi CLI sessions do not inherit Wayang protected-identity preflight", async () => {
+	const fixtureRoot = path.join(tmpdir(), `command-guard-cli-scope-${process.pid}`);
+	const configHome = path.join(fixtureRoot, "config");
+	const pinPath = path.join(configHome, "pi", PIN_FILENAME);
+	const cwd = path.join(fixtureRoot, "project");
+	process.env.XDG_CONFIG_HOME = configHome;
+	process.env.PI_COMMAND_GUARD_MODE = "off";
+
+	const toolCases: Array<[string, Record<string, unknown>]> = [
+		["bash", { command: 'resolvectl query -4 --cache=no archlinux.org; echo "rc=$?"' }],
+		["bash", { command: `cat ${pinPath}` }],
+		["bash", { command: "env" }],
+		["read", { path: pinPath }],
+		["custom_path_tool", { path: pinPath }],
+	];
+	for (const [toolName, input] of toolCases) {
+		const harness = createHarness(cwd, "cli");
+		const outcome = await harness.tool(toolName, input);
+		assert.equal(outcome.result, undefined, toolName);
+		assert.equal(outcome.executed, true, toolName);
+		assert.equal(harness.modelLookups, 0, toolName);
+	}
+
+	for (const command of [
+		'resolvectl query -4 --cache=no archlinux.org; echo "rc=$?"',
+		`cat ${pinPath}`,
+		"env",
+	]) {
+		const harness = createHarness(cwd, "cli");
+		const outcome = await harness.userBash(command);
+		assert.equal(outcome.result, undefined, command);
+		assert.equal(outcome.executed, true, command);
+		assert.equal(harness.modelLookups, 0, command);
+	}
+});
+
+test("Wayang-owned sessions keep protected preflight for the reported DNS-query shape", async () => {
+	const fixtureRoot = path.join(tmpdir(), `command-guard-wayang-dns-scope-${process.pid}`);
+	process.env.XDG_CONFIG_HOME = path.join(fixtureRoot, "config");
+	process.env.PI_COMMAND_GUARD_MODE = "off";
+	const cwd = path.join(fixtureRoot, "project");
+	const command = 'resolvectl query -4 --cache=no archlinux.org; echo "rc=$?"';
+
+	const toolHarness = createHarness(cwd);
+	assertGenericToolDenial(
+		await toolHarness.tool("bash", { command }),
+		toolHarness.modelLookups,
+		UNRESOLVED_DENIAL,
+	);
+	const userHarness = createHarness(cwd);
+	assertGenericUserBashDenial(
+		await userHarness.userBash(command),
+		userHarness.modelLookups,
+		UNRESOLVED_DENIAL,
+	);
+});
+
+test("PIN path invariant is unconditional across Wayang modes, tools, and direct/relative/ancestor/glob scopes", async () => {
 	const fixtureRoot = path.join(tmpdir(), `command-guard-pin-invariant-${process.pid}`);
 	const configHome = path.join(fixtureRoot, "config");
 	const pinParent = path.join(configHome, "pi");

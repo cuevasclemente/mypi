@@ -16,6 +16,7 @@ const configHome = "/tmp/pi-command-guard-synthetic-config";
 const runtimeDir = "/tmp/pi-command-guard-synthetic-runtime";
 const workspace = "/tmp/pi-command-guard-synthetic-workspace";
 const pinPath = `${configHome}/pi/command-guard-identity-pin`;
+const WAYANG_SESSION_OWNERSHIP_SYMBOL = Symbol.for("wayang.owned-session-managers.v1");
 
 process.env.XDG_CONFIG_HOME = configHome;
 process.env.XDG_RUNTIME_DIR = runtimeDir;
@@ -160,6 +161,17 @@ function syntheticExtension() {
 		},
 	};
 	commandAuthorizationMonitor(pi as any);
+	const sessionManager = {
+		getBranch: () => [],
+		getSessionId: () => undefined,
+		getSessionFile: () => undefined,
+	};
+	const globals = globalThis as any;
+	const owners = globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] instanceof WeakSet
+		? globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] as WeakSet<object>
+		: new WeakSet<object>();
+	owners.add(sessionManager);
+	globals[WAYANG_SESSION_OWNERSHIP_SYMBOL] = owners;
 	const ctx = {
 		cwd: workspace,
 		hasUI: false,
@@ -169,6 +181,7 @@ function syntheticExtension() {
 				throw new Error("synthetic model registry must not be touched");
 			},
 		}),
+		sessionManager,
 	};
 	const toolCall = handlers.get("tool_call")?.[0] as Handler;
 	const userBash = handlers.get("user_bash")?.[0] as Handler;
@@ -190,7 +203,7 @@ function syntheticExtension() {
 	};
 }
 
-test("tool_call preflight is unconditional, fixed-reason, and before model execution", async () => {
+test("Wayang tool_call preflight is mode-independent, fixed-reason, and before model execution", async () => {
 	const harness = syntheticExtension();
 	assert.equal(typeof harness.toolCall, "function");
 
@@ -239,7 +252,7 @@ test("tool_call preflight is unconditional, fixed-reason, and before model execu
 	assert.deepEqual(harness.calls(), { modelCalls: 0, execCalls: 3 });
 });
 
-test("user_bash returns precise denial results before execution and passes ordinary controls", async () => {
+test("Wayang user_bash returns precise denial results before execution and passes ordinary controls", async () => {
 	const harness = syntheticExtension();
 	assert.equal(typeof harness.userBash, "function");
 
