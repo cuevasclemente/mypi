@@ -105,3 +105,37 @@ drift check) remains the current validator.
 All integration is additive on top of `main` (`5b1e8f4`); `main` fast-forward
 is the only mutation of an existing ref. No history was rewritten. Restore by
 pointing `main` back at `5b1e8f4` if needed.
+
+## Remote integration (same session, later)
+
+Clemente authorized accepting GitHub's host key. The three host keys fetched
+from `api.github.com` over TLS were fingerprint-verified locally against the
+published values and installed into `~/.ssh/known_hosts` (backup first:
+`known_hosts.bak-20260901T100918Z`). SSH key auth remains unavailable
+noninteractively (`id_ed25519` and `frost_key_lightsail` are
+passphrase-protected with no agent; only `frost-walrus-training-key` is
+unencrypted and is not registered with GitHub), so the release traveled over
+HTTPS with the existing credential helper.
+
+The push surfaced a non-fast-forward: remote `main` held a PR #2 merge
+(`fa32130`, guarded SSH control-socket support in
+`plugins/command-authorization-monitor.ts`, 2026-08-19) plus two README
+license-wording edits; the remote line had none of the August work (divergence
+point `649321b`). Resolution: merged remote into the release line at
+`10d9f93` — the plugin conflict resolved to the runtime-authoritative variant
+(the remote PR version still fed assistant dialogue/thinking into the
+authorization request; the deployed version excludes assistant-authored
+context by construction and pins Together with no cross-provider fallback),
+and the README adopted Clemente's final Mozilla license wording from
+`02bf845`. PR #2's two test files pass fully against the deployed variant
+(19/0 and 6/0).
+
+Validation after the merge: npm suites 37/0, tests/ 89/0 including the PR
+files, tribe parity plan 147 entries with unchanged policy SHA
+`207a3c880720f39261ed9e12d97c2eccc1f87fd45ee89550876170dc1d71c86e` (byte
+identical at `f68e4b7` and `10d9f93`; the earlier noted `8536b062…` value was
+a different artifact's hash). `main` fast-forwarded to `10d9f93` in its
+checking-out worktree (`.worktrees/terra-main-update`, clean) and pushed:
+`origin/main` = `10d9f93`. Force-push and history rewrite were never
+considered for the remote PR merge; rebase was rejected to preserve recorded
+release hashes.
