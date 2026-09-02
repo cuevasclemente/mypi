@@ -11,7 +11,7 @@
     "reconcile:memory-context": "node --import tsx plugins/memory-first-compaction/reconcile-ledger.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.84.1-wayang.29fcca05.tgz",
+    "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.84.1-wayang.4f7d03ce.tgz",
     "@types/node": "^26.2.0",
     "exa-mcp-server": "^3.2.1",
     "tsx": "^4.23.12",
